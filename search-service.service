@@ -1,0 +1,41 @@
+[Unit]
+Description=Simple Search Service
+Documentation=https://github.com/yourusername/simple-search-service
+After=network.target
+
+[Service]
+Type=simple
+User=search
+Group=search
+WorkingDirectory=/opt/search-service
+
+# Environment variables
+Environment="DATA_DIR=/var/lib/search-service"
+Environment="PORT=3000"
+Environment="RUST_LOG=info"
+
+# Service binary
+ExecStart=/opt/search-service/simple-search-service
+
+# Restart policy
+Restart=always
+RestartSec=10
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/search-service
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=search-service
+
+[Install]
+WantedBy=multi-user.target
