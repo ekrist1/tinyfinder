@@ -1,0 +1,11 @@
+/home/espen/godev/rustfind/target/release/deps/bitpacking-db57e69b3735bfc3.d: /home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/lib.rs /home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/macros.rs /home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/macros_simple.rs /home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/bitpacker1x.rs /home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/bitpacker4x.rs
+
+/home/espen/godev/rustfind/target/release/deps/libbitpacking-db57e69b3735bfc3.rlib: /home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/lib.rs /home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/macros.rs /home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/macros_simple.rs /home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/bitpacker1x.rs /home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/bitpacker4x.rs
+
+/home/espen/godev/rustfind/target/release/deps/libbitpacking-db57e69b3735bfc3.rmeta: /home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/lib.rs /home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/macros.rs /home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/macros_simple.rs /home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/bitpacker1x.rs /home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/bitpacker4x.rs
+
+/home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/lib.rs:
+/home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/macros.rs:
+/home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/macros_simple.rs:
+/home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/bitpacker1x.rs:
+/home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/bitpacking-0.9.3/src/bitpacker4x.rs:

@@ -1,0 +1,12 @@
+/home/espen/godev/rustfind/target/release/deps/fs4-7b46245a5b0572bd.d: /home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fs4-0.8.4/src/lib.rs /home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fs4-0.8.4/src/unix.rs /home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fs4-0.8.4/src/unix/sync_impl.rs /home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fs4-0.8.4/src/file_ext.rs /home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fs4-0.8.4/src/fs_stats.rs /home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fs4-0.8.4/src/file_ext/sync_impl.rs
+
+/home/espen/godev/rustfind/target/release/deps/libfs4-7b46245a5b0572bd.rlib: /home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fs4-0.8.4/src/lib.rs /home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fs4-0.8.4/src/unix.rs /home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fs4-0.8.4/src/unix/sync_impl.rs /home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fs4-0.8.4/src/file_ext.rs /home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fs4-0.8.4/src/fs_stats.rs /home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fs4-0.8.4/src/file_ext/sync_impl.rs
+
+/home/espen/godev/rustfind/target/release/deps/libfs4-7b46245a5b0572bd.rmeta: /home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fs4-0.8.4/src/lib.rs /home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fs4-0.8.4/src/unix.rs /home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fs4-0.8.4/src/unix/sync_impl.rs /home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fs4-0.8.4/src/file_ext.rs /home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fs4-0.8.4/src/fs_stats.rs /home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fs4-0.8.4/src/file_ext/sync_impl.rs
+
+/home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fs4-0.8.4/src/lib.rs:
+/home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fs4-0.8.4/src/unix.rs:
+/home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fs4-0.8.4/src/unix/sync_impl.rs:
+/home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fs4-0.8.4/src/file_ext.rs:
+/home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fs4-0.8.4/src/fs_stats.rs:
+/home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/fs4-0.8.4/src/file_ext/sync_impl.rs:

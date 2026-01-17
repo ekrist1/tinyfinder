@@ -12,7 +12,7 @@ pub struct MetadataStore {
 impl MetadataStore {
     pub fn new(db_path: &str) -> Result<Self> {
         let conn = Connection::open(db_path)?;
-        
+
         conn.execute(
             "CREATE TABLE IF NOT EXISTS indices (
                 name TEXT PRIMARY KEY,
@@ -61,12 +61,12 @@ impl MetadataStore {
 
     pub fn list_indices(&self) -> Result<Vec<IndexInfo>> {
         let conn = self.conn.lock().unwrap();
-        
+
         let mut stmt = conn.prepare(
             "SELECT i.name, i.created_at, COUNT(d.id) as doc_count 
              FROM indices i 
              LEFT JOIN documents d ON i.name = d.index_name 
-             GROUP BY i.name, i.created_at"
+             GROUP BY i.name, i.created_at",
         )?;
 
         let indices = stmt
@@ -101,9 +101,10 @@ impl MetadataStore {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn get_document_count(&self, index_name: &str) -> Result<u64> {
         let conn = self.conn.lock().unwrap();
-        
+
         let count: u64 = conn.query_row(
             "SELECT COUNT(*) FROM documents WHERE index_name = ?1",
             params![index_name],

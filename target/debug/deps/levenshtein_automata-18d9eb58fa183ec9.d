@@ -1,0 +1,10 @@
+/home/espen/godev/rustfind/target/debug/deps/levenshtein_automata-18d9eb58fa183ec9.d: /home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/levenshtein_automata-0.2.1/src/lib.rs /home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/levenshtein_automata-0.2.1/src/alphabet.rs /home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/levenshtein_automata-0.2.1/src/dfa.rs /home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/levenshtein_automata-0.2.1/src/index.rs /home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/levenshtein_automata-0.2.1/src/levenshtein_nfa.rs /home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/levenshtein_automata-0.2.1/src/parametric_dfa.rs
+
+/home/espen/godev/rustfind/target/debug/deps/liblevenshtein_automata-18d9eb58fa183ec9.rmeta: /home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/levenshtein_automata-0.2.1/src/lib.rs /home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/levenshtein_automata-0.2.1/src/alphabet.rs /home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/levenshtein_automata-0.2.1/src/dfa.rs /home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/levenshtein_automata-0.2.1/src/index.rs /home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/levenshtein_automata-0.2.1/src/levenshtein_nfa.rs /home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/levenshtein_automata-0.2.1/src/parametric_dfa.rs
+
+/home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/levenshtein_automata-0.2.1/src/lib.rs:
+/home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/levenshtein_automata-0.2.1/src/alphabet.rs:
+/home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/levenshtein_automata-0.2.1/src/dfa.rs:
+/home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/levenshtein_automata-0.2.1/src/index.rs:
+/home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/levenshtein_automata-0.2.1/src/levenshtein_nfa.rs:
+/home/espen/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/levenshtein_automata-0.2.1/src/parametric_dfa.rs:

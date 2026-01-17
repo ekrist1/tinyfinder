@@ -13,7 +13,7 @@ pub async fn health_check() -> impl IntoResponse {
     Json(serde_json::json!({
         "status": "healthy",
         "service": "simple-search-service",
-        "version": "0.1.0"
+        "version": "0.2.0"
     }))
 }
 
@@ -29,12 +29,16 @@ pub async fn create_index(
                 field_type: "text".to_string(),
                 stored: true,
                 indexed: true,
+                analyzer: "default".to_string(),
+                fast: false,
             },
             FieldConfig {
                 name: "content".to_string(),
                 field_type: "text".to_string(),
                 stored: true,
                 indexed: true,
+                analyzer: "default".to_string(),
+                fast: false,
             },
         ]
     } else {
@@ -180,9 +184,17 @@ pub async fn search(
     Path(index_name): Path<String>,
     Json(payload): Json<SearchRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<SearchResponse>>)> {
-    let (hits, took_ms) = state
+    let (hits, total, took_ms, aggregations) = state
         .search_engine
-        .search(&index_name, &payload.query, payload.limit, &payload.fields)
+        .search(
+            &index_name,
+            &payload.query,
+            payload.limit,
+            payload.offset,
+            &payload.fields,
+            payload.highlight.as_ref(),
+            &payload.aggregations,
+        )
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -190,10 +202,76 @@ pub async fn search(
             )
         })?;
 
+    let has_more = payload.offset + hits.len() < total;
+
     let response = SearchResponse {
         took_ms,
-        total: hits.len(),
+        total,
+        offset: payload.offset,
+        limit: payload.limit,
+        has_more,
         hits,
+        aggregations,
+    };
+
+    Ok(Json(ApiResponse::success(response)))
+}
+
+pub async fn get_index_stats(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<IndexStats>>)> {
+    // Get created_at from metadata store
+    let indices = state.metadata_store.list_indices().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::error(e.to_string())),
+        )
+    })?;
+
+    let index_info = indices.iter().find(|i| i.name == name).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error(format!("Index not found: {}", name))),
+        )
+    })?;
+
+    let stats = state
+        .search_engine
+        .get_index_stats(&name, &index_info.created_at)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::error(e.to_string())),
+            )
+        })?;
+
+    Ok(Json(ApiResponse::success(stats)))
+}
+
+pub async fn suggest(
+    State(state): State<Arc<AppState>>,
+    Path(index_name): Path<String>,
+    Json(payload): Json<SuggestRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<SuggestResponse>>)> {
+    let (suggestions, took_ms) = state
+        .search_engine
+        .suggest(
+            &index_name,
+            &payload.prefix,
+            payload.field.as_deref(),
+            payload.limit,
+        )
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::error(e.to_string())),
+            )
+        })?;
+
+    let response = SuggestResponse {
+        suggestions,
+        took_ms,
     };
 
     Ok(Json(ApiResponse::success(response)))
@@ -212,7 +290,10 @@ pub async fn bulk_operation(
         let result = match op.operation.as_str() {
             "index" => {
                 if let Some(doc) = &op.document {
-                    match state.search_engine.add_documents(&index_name, &[doc.clone()]) {
+                    match state
+                        .search_engine
+                        .add_documents(&index_name, std::slice::from_ref(doc))
+                    {
                         Ok(_) => {
                             let _ = state.metadata_store.add_document(&index_name, &doc.id);
                             Ok(())

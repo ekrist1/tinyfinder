@@ -1,34 +1,54 @@
 use anyhow::{anyhow, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
 use tantivy::schema::*;
-use tantivy::{Index, IndexWriter, ReloadPolicy};
+use tantivy::tokenizer::{LowerCaser, SimpleTokenizer, Stemmer, TextAnalyzer};
+use tantivy::{Index, IndexWriter, ReloadPolicy, TantivyDocument};
 
-use crate::models::{Document, FieldConfig, SearchHit};
+use crate::models::{
+    AggregationBucket, AggregationRequest, AggregationResult, Document, FieldConfig, FieldStats,
+    HighlightOptions, IndexStats, SearchHit, StatsResult,
+};
+
+pub type SearchResult = Result<(Vec<SearchHit>, usize, f64, Option<Vec<AggregationResult>>)>;
 
 pub struct SearchEngine {
     base_path: String,
     indices: Arc<RwLock<HashMap<String, IndexHandle>>>,
 }
 
-struct IndexHandle {
-    index: Index,
-    schema: Schema,
-    writer: Arc<RwLock<IndexWriter>>,
-    field_map: HashMap<String, Field>,
+pub struct IndexHandle {
+    pub index: Index,
+    pub schema: Schema,
+    pub writer: Arc<RwLock<IndexWriter>>,
+    pub field_map: HashMap<String, Field>,
+    pub field_configs: Vec<FieldConfig>,
 }
 
 impl SearchEngine {
     pub fn new(base_path: &str) -> Result<Self> {
         std::fs::create_dir_all(base_path)?;
-        
+
         Ok(Self {
             base_path: base_path.to_string(),
             indices: Arc::new(RwLock::new(HashMap::new())),
         })
+    }
+
+    fn register_analyzers(index: &Index) {
+        // Register Norwegian analyzer with stemming
+        let norwegian = TextAnalyzer::builder(SimpleTokenizer::default())
+            .filter(LowerCaser)
+            .filter(Stemmer::new(tantivy::tokenizer::Language::Norwegian))
+            .build();
+        index.tokenizers().register("norwegian", norwegian);
+
+        // Register raw analyzer (no tokenization)
+        let raw = TextAnalyzer::builder(tantivy::tokenizer::RawTokenizer::default()).build();
+        index.tokenizers().register("raw", raw);
     }
 
     pub fn create_index(&self, name: &str, fields: &[FieldConfig]) -> Result<()> {
@@ -48,19 +68,25 @@ impl SearchEngine {
                         options = options.set_stored();
                     }
                     if field_config.indexed {
+                        let tokenizer = match field_config.analyzer.as_str() {
+                            "norwegian" => "norwegian",
+                            "raw" => "raw",
+                            _ => "default",
+                        };
                         options = options.set_indexing_options(
                             TextFieldIndexing::default()
-                                .set_tokenizer("default")
+                                .set_tokenizer(tokenizer)
                                 .set_index_option(IndexRecordOption::WithFreqsAndPositions),
                         );
                     }
                     schema_builder.add_text_field(&field_config.name, options)
                 }
                 "string" => {
-                    let mut options = STORED;
-                    if field_config.indexed {
-                        options = STRING | STORED;
-                    }
+                    let options = if field_config.indexed {
+                        STRING | STORED
+                    } else {
+                        TextOptions::default().set_stored()
+                    };
                     schema_builder.add_text_field(&field_config.name, options)
                 }
                 "i64" => {
@@ -70,6 +96,9 @@ impl SearchEngine {
                     }
                     if field_config.indexed {
                         options = options.set_indexed();
+                    }
+                    if field_config.fast {
+                        options = options.set_fast();
                     }
                     schema_builder.add_i64_field(&field_config.name, options)
                 }
@@ -81,10 +110,30 @@ impl SearchEngine {
                     if field_config.indexed {
                         options = options.set_indexed();
                     }
+                    if field_config.fast {
+                        options = options.set_fast();
+                    }
                     schema_builder.add_f64_field(&field_config.name, options)
                 }
+                "date" => {
+                    let mut options = DateOptions::default()
+                        .set_precision(tantivy::schema::DateTimePrecision::Seconds);
+                    if field_config.stored {
+                        options = options.set_stored();
+                    }
+                    if field_config.indexed {
+                        options = options.set_indexed();
+                    }
+                    if field_config.fast {
+                        options = options.set_fast();
+                    }
+                    schema_builder.add_date_field(&field_config.name, options)
+                }
                 _ => {
-                    return Err(anyhow!("Unsupported field type: {}", field_config.field_type));
+                    return Err(anyhow!(
+                        "Unsupported field type: {}",
+                        field_config.field_type
+                    ));
                 }
             };
             field_map.insert(field_config.name.clone(), field);
@@ -95,6 +144,10 @@ impl SearchEngine {
         std::fs::create_dir_all(&index_path)?;
 
         let index = Index::create_in_dir(&index_path, schema.clone())?;
+
+        // Register custom analyzers
+        Self::register_analyzers(&index);
+
         let writer = index.writer(50_000_000)?; // 50MB buffer
 
         let handle = IndexHandle {
@@ -102,9 +155,13 @@ impl SearchEngine {
             schema,
             writer: Arc::new(RwLock::new(writer)),
             field_map,
+            field_configs: fields.to_vec(),
         };
 
-        self.indices.write().unwrap().insert(name.to_string(), handle);
+        self.indices
+            .write()
+            .unwrap()
+            .insert(name.to_string(), handle);
 
         Ok(())
     }
@@ -127,21 +184,44 @@ impl SearchEngine {
             // Add custom fields
             for (field_name, value) in &doc.fields {
                 if let Some(field) = handle.field_map.get(field_name) {
-                    match value {
-                        serde_json::Value::String(s) => {
-                            tantivy_doc.add_text(*field, s);
-                        }
-                        serde_json::Value::Number(n) => {
-                            if let Some(i) = n.as_i64() {
-                                tantivy_doc.add_i64(*field, i);
-                            } else if let Some(f) = n.as_f64() {
-                                tantivy_doc.add_f64(*field, f);
+                    // Get field config to check type
+                    let field_type = handle
+                        .field_configs
+                        .iter()
+                        .find(|fc| fc.name == *field_name)
+                        .map(|fc| fc.field_type.as_str())
+                        .unwrap_or("text");
+
+                    match field_type {
+                        "date" => {
+                            // Parse date from RFC3339 string or Unix timestamp
+                            if let Some(date_str) = value.as_str() {
+                                if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(date_str) {
+                                    let tantivy_dt =
+                                        tantivy::DateTime::from_timestamp_secs(dt.timestamp());
+                                    tantivy_doc.add_date(*field, tantivy_dt);
+                                }
+                            } else if let Some(ts) = value.as_i64() {
+                                let tantivy_dt = tantivy::DateTime::from_timestamp_secs(ts);
+                                tantivy_doc.add_date(*field, tantivy_dt);
                             }
                         }
-                        serde_json::Value::Bool(b) => {
-                            tantivy_doc.add_i64(*field, if *b { 1 } else { 0 });
-                        }
-                        _ => {}
+                        _ => match value {
+                            serde_json::Value::String(s) => {
+                                tantivy_doc.add_text(*field, s);
+                            }
+                            serde_json::Value::Number(n) => {
+                                if let Some(i) = n.as_i64() {
+                                    tantivy_doc.add_i64(*field, i);
+                                } else if let Some(f) = n.as_f64() {
+                                    tantivy_doc.add_f64(*field, f);
+                                }
+                            }
+                            serde_json::Value::Bool(b) => {
+                                tantivy_doc.add_i64(*field, if *b { 1 } else { 0 });
+                            }
+                            _ => {}
+                        },
                     }
                 }
             }
@@ -153,15 +233,19 @@ impl SearchEngine {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn search(
         &self,
         index_name: &str,
         query_str: &str,
         limit: usize,
+        offset: usize,
         fields: &[String],
-    ) -> Result<(Vec<SearchHit>, f64)> {
+        highlight_options: Option<&HighlightOptions>,
+        aggregations: &[AggregationRequest],
+    ) -> SearchResult {
         let start = std::time::Instant::now();
-        
+
         let indices = self.indices.read().unwrap();
         let handle = indices
             .get(index_name)
@@ -177,10 +261,17 @@ impl SearchEngine {
 
         // Build query parser for specified fields or all text fields
         let query_fields: Vec<Field> = if fields.is_empty() {
+            // Only include text fields in the default query parser to avoid parse errors
             handle
                 .field_map
-                .values()
-                .copied()
+                .iter()
+                .filter(|(_, field)| {
+                    matches!(
+                        handle.schema.get_field_entry(**field).field_type(),
+                        FieldType::Str(_)
+                    )
+                })
+                .map(|(_, field)| *field)
                 .collect()
         } else {
             fields
@@ -189,28 +280,91 @@ impl SearchEngine {
                 .collect()
         };
 
-        let query_parser = QueryParser::for_index(&handle.index, query_fields);
+        let query_parser = QueryParser::for_index(&handle.index, query_fields.clone());
         let query = query_parser.parse_query(query_str)?;
 
-        let top_docs = searcher.search(&query, &TopDocs::with_limit(limit))?;
+        // Get total document count that matches the query
+        let total = searcher.search(&query, &tantivy::collector::Count)?;
+
+        // Fetch offset + limit results, then skip offset
+        let top_docs = searcher.search(&query, &TopDocs::with_limit(offset + limit))?;
 
         let mut hits = Vec::new();
-        for (score, doc_address) in top_docs {
+        for (score, doc_address) in top_docs.into_iter().skip(offset) {
             let retrieved_doc: TantivyDocument = searcher.doc(doc_address)?;
             let mut field_values = HashMap::new();
 
             for (field_name, field) in &handle.field_map {
-                if let Some(field_values_iter) = retrieved_doc.get_all(*field).next() {
-                    let value = match field_values_iter {
-                        tantivy::schema::Value::Str(s) => serde_json::Value::String(s.to_string()),
-                        tantivy::schema::Value::U64(n) => serde_json::json!(n),
-                        tantivy::schema::Value::I64(n) => serde_json::json!(n),
-                        tantivy::schema::Value::F64(n) => serde_json::json!(n),
+                if let Some(field_value) = retrieved_doc.get_all(*field).next() {
+                    let value = match field_value {
+                        tantivy::schema::OwnedValue::Str(s) => {
+                            serde_json::Value::String(s.to_string())
+                        }
+                        tantivy::schema::OwnedValue::U64(n) => serde_json::json!(n),
+                        tantivy::schema::OwnedValue::I64(n) => serde_json::json!(n),
+                        tantivy::schema::OwnedValue::F64(n) => serde_json::json!(n),
+                        tantivy::schema::OwnedValue::Date(d) => {
+                            serde_json::Value::String(d.into_utc().to_string())
+                        }
                         _ => continue,
                     };
                     field_values.insert(field_name.clone(), value);
                 }
             }
+
+            // Generate highlights if requested
+            let highlights = if let Some(opts) = highlight_options {
+                if opts.enabled {
+                    let mut highlight_map = HashMap::new();
+                    let highlight_fields: Vec<&String> = if opts.fields.is_empty() {
+                        query_fields
+                            .iter()
+                            .filter_map(|f| {
+                                handle.field_map.iter().find_map(|(name, field)| {
+                                    if field == f {
+                                        Some(name)
+                                    } else {
+                                        None
+                                    }
+                                })
+                            })
+                            .collect()
+                    } else {
+                        opts.fields.iter().collect()
+                    };
+
+                    for field_name in highlight_fields {
+                        if let Some(field) = handle.field_map.get(field_name) {
+                            // Check if this is a text field
+                            let field_entry = handle.schema.get_field_entry(*field);
+                            if let FieldType::Str(_) = field_entry.field_type() {
+                                if let Ok(snippet_gen) = tantivy::snippet::SnippetGenerator::create(
+                                    &searcher, &query, *field,
+                                ) {
+                                    let snippet = snippet_gen.snippet_from_doc(&retrieved_doc);
+                                    let html = snippet.to_html();
+                                    // Replace default <b> tags with custom tags
+                                    let highlighted = html
+                                        .replace("<b>", &opts.pre_tag)
+                                        .replace("</b>", &opts.post_tag);
+                                    if !highlighted.is_empty() {
+                                        highlight_map.insert(field_name.clone(), vec![highlighted]);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if highlight_map.is_empty() {
+                        None
+                    } else {
+                        Some(highlight_map)
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
 
             let id = field_values
                 .get("id")
@@ -222,12 +376,355 @@ impl SearchEngine {
                 id,
                 score,
                 fields: field_values,
+                highlights,
             });
+        }
+
+        // Process aggregations
+        let agg_results = if !aggregations.is_empty() {
+            let mut results = Vec::new();
+            for agg_req in aggregations {
+                if let Some(agg_result) =
+                    self.compute_aggregation(handle, &searcher, &query, agg_req)?
+                {
+                    results.push(agg_result);
+                }
+            }
+            if results.is_empty() {
+                None
+            } else {
+                Some(results)
+            }
+        } else {
+            None
+        };
+
+        let took_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+        Ok((hits, total, took_ms, agg_results))
+    }
+
+    fn compute_aggregation(
+        &self,
+        handle: &IndexHandle,
+        searcher: &tantivy::Searcher,
+        query: &dyn tantivy::query::Query,
+        agg_req: &AggregationRequest,
+    ) -> Result<Option<AggregationResult>> {
+        let field = match handle.field_map.get(&agg_req.field) {
+            Some(f) => *f,
+            None => return Ok(None),
+        };
+
+        match agg_req.agg_type.as_str() {
+            "terms" => {
+                // Collect unique values and their counts
+                let top_docs = searcher.search(query, &TopDocs::with_limit(10000))?;
+                let mut term_counts: HashMap<String, u64> = HashMap::new();
+
+                for (_score, doc_address) in top_docs {
+                    let doc: TantivyDocument = searcher.doc(doc_address)?;
+                    let key: Option<String> =
+                        doc.get_all(field).next().and_then(|value| match value {
+                            tantivy::schema::OwnedValue::Str(s) => Some(s.to_string()),
+                            tantivy::schema::OwnedValue::I64(n) => Some(n.to_string()),
+                            tantivy::schema::OwnedValue::U64(n) => Some(n.to_string()),
+                            tantivy::schema::OwnedValue::F64(n) => Some(n.to_string()),
+                            _ => None,
+                        });
+                    if let Some(k) = key {
+                        *term_counts.entry(k).or_insert(0) += 1;
+                    }
+                }
+
+                let size = agg_req.size.unwrap_or(10);
+                let mut buckets: Vec<_> = term_counts.into_iter().collect();
+                buckets.sort_by(|a, b| b.1.cmp(&a.1));
+                buckets.truncate(size);
+
+                let result_buckets = buckets
+                    .into_iter()
+                    .map(|(key, count)| AggregationBucket {
+                        key: serde_json::Value::String(key),
+                        doc_count: count,
+                    })
+                    .collect();
+
+                Ok(Some(AggregationResult {
+                    name: agg_req.name.clone(),
+                    buckets: Some(result_buckets),
+                    stats: None,
+                }))
+            }
+            "stats" => {
+                let top_docs = searcher.search(query, &TopDocs::with_limit(100000))?;
+                let mut values: Vec<f64> = Vec::new();
+
+                for (_score, doc_address) in top_docs {
+                    let doc: TantivyDocument = searcher.doc(doc_address)?;
+                    let num: Option<f64> =
+                        doc.get_all(field).next().and_then(|value| match value {
+                            tantivy::schema::OwnedValue::I64(n) => Some(*n as f64),
+                            tantivy::schema::OwnedValue::U64(n) => Some(*n as f64),
+                            tantivy::schema::OwnedValue::F64(n) => Some(*n),
+                            _ => None,
+                        });
+                    if let Some(n) = num {
+                        values.push(n);
+                    }
+                }
+
+                if values.is_empty() {
+                    return Ok(None);
+                }
+
+                let count = values.len() as u64;
+                let sum: f64 = values.iter().sum();
+                let avg = if count > 0 {
+                    Some(sum / count as f64)
+                } else {
+                    None
+                };
+                let min = values.iter().copied().fold(f64::INFINITY, f64::min);
+                let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+
+                Ok(Some(AggregationResult {
+                    name: agg_req.name.clone(),
+                    buckets: None,
+                    stats: Some(StatsResult {
+                        count,
+                        sum,
+                        avg,
+                        min: Some(min),
+                        max: Some(max),
+                    }),
+                }))
+            }
+            "histogram" => {
+                let interval = agg_req.interval.unwrap_or(10.0);
+                let top_docs = searcher.search(query, &TopDocs::with_limit(100000))?;
+                let mut bucket_counts: HashMap<i64, u64> = HashMap::new();
+
+                for (_score, doc_address) in top_docs {
+                    let doc: TantivyDocument = searcher.doc(doc_address)?;
+                    let num: Option<f64> =
+                        doc.get_all(field).next().and_then(|value| match value {
+                            tantivy::schema::OwnedValue::I64(n) => Some(*n as f64),
+                            tantivy::schema::OwnedValue::U64(n) => Some(*n as f64),
+                            tantivy::schema::OwnedValue::F64(n) => Some(*n),
+                            _ => None,
+                        });
+                    if let Some(n) = num {
+                        let bucket_key = (n / interval).floor() as i64;
+                        *bucket_counts.entry(bucket_key).or_insert(0) += 1;
+                    }
+                }
+
+                let mut buckets: Vec<_> = bucket_counts.into_iter().collect();
+                buckets.sort_by_key(|(k, _)| *k);
+
+                let result_buckets = buckets
+                    .into_iter()
+                    .map(|(key, count)| AggregationBucket {
+                        key: serde_json::json!(key as f64 * interval),
+                        doc_count: count,
+                    })
+                    .collect();
+
+                Ok(Some(AggregationResult {
+                    name: agg_req.name.clone(),
+                    buckets: Some(result_buckets),
+                    stats: None,
+                }))
+            }
+            "range" => {
+                let ranges = match &agg_req.ranges {
+                    Some(r) => r,
+                    None => return Ok(None),
+                };
+
+                let top_docs = searcher.search(query, &TopDocs::with_limit(100000))?;
+                let mut values: Vec<f64> = Vec::new();
+
+                for (_score, doc_address) in top_docs {
+                    let doc: TantivyDocument = searcher.doc(doc_address)?;
+                    let num: Option<f64> =
+                        doc.get_all(field).next().and_then(|value| match value {
+                            tantivy::schema::OwnedValue::I64(n) => Some(*n as f64),
+                            tantivy::schema::OwnedValue::U64(n) => Some(*n as f64),
+                            tantivy::schema::OwnedValue::F64(n) => Some(*n),
+                            _ => None,
+                        });
+                    if let Some(n) = num {
+                        values.push(n);
+                    }
+                }
+
+                let result_buckets = ranges
+                    .iter()
+                    .map(|range| {
+                        let count = values
+                            .iter()
+                            .filter(|&&v| {
+                                let above_from = range.from.map(|f| v >= f).unwrap_or(true);
+                                let below_to = range.to.map(|t| v < t).unwrap_or(true);
+                                above_from && below_to
+                            })
+                            .count() as u64;
+
+                        let key = format!(
+                            "{}-{}",
+                            range
+                                .from
+                                .map(|f| f.to_string())
+                                .unwrap_or_else(|| "*".to_string()),
+                            range
+                                .to
+                                .map(|t| t.to_string())
+                                .unwrap_or_else(|| "*".to_string())
+                        );
+
+                        AggregationBucket {
+                            key: serde_json::Value::String(key),
+                            doc_count: count,
+                        }
+                    })
+                    .collect();
+
+                Ok(Some(AggregationResult {
+                    name: agg_req.name.clone(),
+                    buckets: Some(result_buckets),
+                    stats: None,
+                }))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    pub fn suggest(
+        &self,
+        index_name: &str,
+        prefix: &str,
+        field: Option<&str>,
+        limit: usize,
+    ) -> Result<(Vec<String>, f64)> {
+        let start = std::time::Instant::now();
+
+        let indices = self.indices.read().unwrap();
+        let handle = indices
+            .get(index_name)
+            .ok_or_else(|| anyhow!("Index not found: {}", index_name))?;
+
+        let reader = handle
+            .index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::OnCommitWithDelay)
+            .try_into()?;
+
+        let searcher = reader.searcher();
+
+        // Build prefix query
+        let query_fields: Vec<Field> = if let Some(f) = field {
+            handle
+                .field_map
+                .get(f)
+                .map(|f| vec![*f])
+                .unwrap_or_default()
+        } else {
+            handle.field_map.values().copied().collect()
+        };
+
+        let prefix_query = format!("{}*", prefix);
+        let query_parser = QueryParser::for_index(&handle.index, query_fields.clone());
+        let query = query_parser.parse_query(&prefix_query)?;
+
+        let top_docs = searcher.search(&query, &TopDocs::with_limit(limit * 10))?;
+
+        // Collect unique field values
+        let mut suggestions: HashSet<String> = HashSet::new();
+
+        for (_score, doc_address) in top_docs {
+            let doc: TantivyDocument = searcher.doc(doc_address)?;
+
+            for field in &query_fields {
+                if let Some(tantivy::schema::OwnedValue::Str(s)) = doc.get_all(*field).next() {
+                    // Check if any word starts with the prefix
+                    for word in s.split_whitespace() {
+                        if word.to_lowercase().starts_with(&prefix.to_lowercase()) {
+                            suggestions.insert(word.to_string());
+                        }
+                    }
+                }
+            }
+
+            if suggestions.len() >= limit {
+                break;
+            }
         }
 
         let took_ms = start.elapsed().as_secs_f64() * 1000.0;
 
-        Ok((hits, took_ms))
+        let mut result: Vec<_> = suggestions.into_iter().collect();
+        result.sort();
+        result.truncate(limit);
+
+        Ok((result, took_ms))
+    }
+
+    pub fn get_index_stats(&self, index_name: &str, created_at: &str) -> Result<IndexStats> {
+        let indices = self.indices.read().unwrap();
+        let handle = indices
+            .get(index_name)
+            .ok_or_else(|| anyhow!("Index not found: {}", index_name))?;
+
+        let reader = handle
+            .index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::OnCommitWithDelay)
+            .try_into()?;
+
+        let searcher = reader.searcher();
+        let doc_count = searcher.num_docs();
+
+        // Calculate index size
+        let index_path = Path::new(&self.base_path).join(index_name);
+        let size_bytes = Self::dir_size(&index_path).unwrap_or(0);
+
+        // Build field stats
+        let fields: Vec<FieldStats> = handle
+            .field_configs
+            .iter()
+            .map(|fc| FieldStats {
+                name: fc.name.clone(),
+                field_type: fc.field_type.clone(),
+                indexed: fc.indexed,
+                stored: fc.stored,
+            })
+            .collect();
+
+        Ok(IndexStats {
+            name: index_name.to_string(),
+            document_count: doc_count,
+            size_bytes,
+            fields,
+            created_at: created_at.to_string(),
+        })
+    }
+
+    fn dir_size(path: &Path) -> std::io::Result<u64> {
+        let mut size = 0;
+        if path.is_dir() {
+            for entry in std::fs::read_dir(path)? {
+                let entry = entry?;
+                let metadata = entry.metadata()?;
+                if metadata.is_file() {
+                    size += metadata.len();
+                } else if metadata.is_dir() {
+                    size += Self::dir_size(&entry.path())?;
+                }
+            }
+        }
+        Ok(size)
     }
 
     pub fn delete_document(&self, index_name: &str, doc_id: &str) -> Result<()> {
@@ -238,7 +735,7 @@ impl SearchEngine {
 
         let mut writer = handle.writer.write().unwrap();
         let id_field = handle.field_map.get("id").unwrap();
-        
+
         writer.delete_term(Term::from_field_text(*id_field, doc_id));
         writer.commit()?;
 
@@ -257,15 +754,12 @@ impl SearchEngine {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn list_indices(&self) -> Vec<String> {
-        self.indices
-            .read()
-            .unwrap()
-            .keys()
-            .cloned()
-            .collect()
+        self.indices.read().unwrap().keys().cloned().collect()
     }
 
+    #[allow(dead_code)]
     pub fn get_document_count(&self, index_name: &str) -> Result<u64> {
         let indices = self.indices.read().unwrap();
         let handle = indices

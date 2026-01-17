@@ -1,0 +1,1 @@
+/home/espen/godev/rustfind/target/release/simple-search-service: /home/espen/godev/rustfind/auth.rs /home/espen/godev/rustfind/handlers.rs /home/espen/godev/rustfind/main.rs /home/espen/godev/rustfind/models.rs /home/espen/godev/rustfind/search.rs /home/espen/godev/rustfind/storage.rs
