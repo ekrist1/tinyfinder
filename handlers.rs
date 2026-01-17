@@ -186,7 +186,7 @@ pub async fn search(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<SearchResponse>>)> {
     let (hits, total, took_ms, aggregations) = state
         .search_engine
-        .search(
+        .search_with_options(
             &index_name,
             &payload.query,
             payload.limit,
@@ -194,6 +194,7 @@ pub async fn search(
             &payload.fields,
             payload.highlight.as_ref(),
             &payload.aggregations,
+            payload.fuzzy,
         )
         .map_err(|e| {
             (

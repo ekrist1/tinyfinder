@@ -153,7 +153,7 @@ Content-Type: application/json
   "boost": {
     "title": 2.0
   },
-  "fuzzy": false
+  "fuzzy": true
 }
 ```
 
@@ -179,6 +179,11 @@ Response:
   }
 }
 ```
+
+#### Partial and fuzzy matching
+
+- Append an asterisk to any term (for example, `"query": "eventyr*"`) to perform a prefix search that matches tokens beginning with that fragment.
+- Set `"fuzzy": true` in the search payload to tolerate a single-character typo (insertions, deletions, substitutions, or transpositions), which helps catch misspellings like `evntyr`.
 
 ### Delete Document
 

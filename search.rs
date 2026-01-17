@@ -3,10 +3,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use tantivy::collector::TopDocs;
-use tantivy::query::QueryParser;
+use tantivy::query::{BooleanQuery, FuzzyTermQuery, Occur, Query, QueryParser, RegexQuery};
 use tantivy::schema::*;
 use tantivy::tokenizer::{LowerCaser, SimpleTokenizer, Stemmer, TextAnalyzer};
-use tantivy::{Index, IndexWriter, ReloadPolicy, TantivyDocument};
+use tantivy::{Index, IndexWriter, ReloadPolicy, TantivyDocument, Term};
 
 use crate::models::{
     AggregationBucket, AggregationRequest, AggregationResult, Document, FieldConfig, FieldStats,
@@ -234,6 +234,7 @@ impl SearchEngine {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     pub fn search(
         &self,
         index_name: &str,
@@ -243,6 +244,54 @@ impl SearchEngine {
         fields: &[String],
         highlight_options: Option<&HighlightOptions>,
         aggregations: &[AggregationRequest],
+    ) -> SearchResult {
+        self.search_internal(
+            index_name,
+            query_str,
+            limit,
+            offset,
+            fields,
+            highlight_options,
+            aggregations,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_with_options(
+        &self,
+        index_name: &str,
+        query_str: &str,
+        limit: usize,
+        offset: usize,
+        fields: &[String],
+        highlight_options: Option<&HighlightOptions>,
+        aggregations: &[AggregationRequest],
+        fuzzy: bool,
+    ) -> SearchResult {
+        self.search_internal(
+            index_name,
+            query_str,
+            limit,
+            offset,
+            fields,
+            highlight_options,
+            aggregations,
+            fuzzy,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn search_internal(
+        &self,
+        index_name: &str,
+        query_str: &str,
+        limit: usize,
+        offset: usize,
+        fields: &[String],
+        highlight_options: Option<&HighlightOptions>,
+        aggregations: &[AggregationRequest],
+        fuzzy: bool,
     ) -> SearchResult {
         let start = std::time::Instant::now();
 
@@ -280,14 +329,13 @@ impl SearchEngine {
                 .collect()
         };
 
-        let query_parser = QueryParser::for_index(&handle.index, query_fields.clone());
-        let query = query_parser.parse_query(query_str)?;
+        let query = Self::build_query(handle, query_str, &query_fields, fuzzy)?;
 
         // Get total document count that matches the query
-        let total = searcher.search(&query, &tantivy::collector::Count)?;
+        let total = searcher.search(query.as_ref(), &tantivy::collector::Count)?;
 
         // Fetch offset + limit results, then skip offset
-        let top_docs = searcher.search(&query, &TopDocs::with_limit(offset + limit))?;
+        let top_docs = searcher.search(query.as_ref(), &TopDocs::with_limit(offset + limit))?;
 
         let mut hits = Vec::new();
         for (score, doc_address) in top_docs.into_iter().skip(offset) {
@@ -296,7 +344,8 @@ impl SearchEngine {
 
             for (field_name, field) in &handle.field_map {
                 if let Some(field_value) = retrieved_doc.get_all(*field).next() {
-                    let value = match field_value {
+                    let owned_value: tantivy::schema::OwnedValue = field_value.into();
+                    let value = match owned_value {
                         tantivy::schema::OwnedValue::Str(s) => {
                             serde_json::Value::String(s.to_string())
                         }
@@ -339,7 +388,9 @@ impl SearchEngine {
                             let field_entry = handle.schema.get_field_entry(*field);
                             if let FieldType::Str(_) = field_entry.field_type() {
                                 if let Ok(snippet_gen) = tantivy::snippet::SnippetGenerator::create(
-                                    &searcher, &query, *field,
+                                    &searcher,
+                                    query.as_ref(),
+                                    *field,
                                 ) {
                                     let snippet = snippet_gen.snippet_from_doc(&retrieved_doc);
                                     let html = snippet.to_html();
@@ -385,7 +436,7 @@ impl SearchEngine {
             let mut results = Vec::new();
             for agg_req in aggregations {
                 if let Some(agg_result) =
-                    self.compute_aggregation(handle, &searcher, &query, agg_req)?
+                    self.compute_aggregation(handle, &searcher, query.as_ref(), agg_req)?
                 {
                     results.push(agg_result);
                 }
@@ -402,6 +453,191 @@ impl SearchEngine {
         let took_ms = start.elapsed().as_secs_f64() * 1000.0;
 
         Ok((hits, total, took_ms, agg_results))
+    }
+
+    fn build_query(
+        handle: &IndexHandle,
+        query_str: &str,
+        query_fields: &[Field],
+        fuzzy: bool,
+    ) -> Result<Box<dyn Query>> {
+        let query_parser = QueryParser::for_index(&handle.index, query_fields.to_vec());
+        
+        // Check if the query contains wildcards (* or ?)
+        let has_wildcard = query_str.chars().any(|ch| matches!(ch, '*' | '?'));
+        
+        // For wildcard queries, we need to create RegexQuery manually
+        // because Tantivy's default QueryParser doesn't support single-term wildcards
+        if has_wildcard {
+            // Convert wildcard syntax to regex syntax
+            // * becomes .* and ? becomes .
+            // Also lowercase the query to match indexed (lowercased) terms
+            let query_lower = query_str.to_lowercase();
+            
+            // Check if it's a field-specific query like "title:eventyr*"
+            let (target_fields, pattern) = if let Some(colon_pos) = query_lower.find(':') {
+                let field_name = &query_lower[..colon_pos];
+                let pattern_part = &query_lower[colon_pos + 1..];
+                
+                // Find the matching field
+                let target_field = handle.field_map.get(field_name).copied();
+                let fields = if let Some(f) = target_field {
+                    vec![f]
+                } else {
+                    // Field not found, use default fields
+                    query_fields.to_vec()
+                };
+                (fields, pattern_part.to_string())
+            } else {
+                (query_fields.to_vec(), query_lower)
+            };
+            
+            // Convert wildcard pattern to regex pattern
+            // Escape regex special chars first, then convert wildcards
+            let regex_pattern = pattern
+                .chars()
+                .map(|c| match c {
+                    '*' => ".*".to_string(),
+                    '?' => ".".to_string(),
+                    // Escape regex special characters
+                    '.' | '+' | '^' | '$' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\' => {
+                        format!("\\{}", c)
+                    }
+                    _ => c.to_string(),
+                })
+                .collect::<String>();
+            
+            // Create regex queries for each target field
+            let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+            for field in &target_fields {
+                // Only create regex queries for text fields
+                let field_entry = handle.schema.get_field_entry(*field);
+                if matches!(field_entry.field_type(), FieldType::Str(_)) {
+                    if let Ok(regex_query) = RegexQuery::from_pattern(&regex_pattern, *field) {
+                        clauses.push((Occur::Should, Box::new(regex_query)));
+                    }
+                }
+            }
+            
+            if !clauses.is_empty() {
+                let wildcard_query: Box<dyn Query> = if clauses.len() == 1 {
+                    clauses.into_iter().next().unwrap().1
+                } else {
+                    Box::new(BooleanQuery::from(clauses))
+                };
+                
+                // If fuzzy is enabled, also add fuzzy queries for the non-wildcard part
+                if fuzzy {
+                    // Extract the prefix (part before the first wildcard)
+                    let prefix = pattern.split(|c| c == '*' || c == '?').next().unwrap_or("");
+                    if !prefix.is_empty() && prefix.len() >= 2 {
+                        let mut fuzzy_clauses: Vec<(Occur, Box<dyn Query>)> = vec![
+                            (Occur::Should, wildcard_query)
+                        ];
+                        
+                        for field in &target_fields {
+                            let field_entry = handle.schema.get_field_entry(*field);
+                            if matches!(field_entry.field_type(), FieldType::Str(_)) {
+                                let term = Term::from_field_text(*field, prefix);
+                                fuzzy_clauses.push((
+                                    Occur::Should,
+                                    Box::new(FuzzyTermQuery::new(term, 1, true))
+                                ));
+                            }
+                        }
+                        
+                        return Ok(Box::new(BooleanQuery::from(fuzzy_clauses)));
+                    }
+                }
+                
+                return Ok(wildcard_query);
+            }
+        }
+        
+        // For non-wildcard queries, use the standard query parser
+        let base_query = query_parser.parse_query(query_str)?;
+
+        if !fuzzy {
+            return Ok(base_query);
+        }
+
+        let tokens: Vec<&str> = query_str.split_whitespace().collect();
+        if tokens.is_empty() {
+            return Ok(base_query);
+        }
+
+        let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+        for token in tokens.iter() {
+            if token.chars().any(|ch| {
+                matches!(
+                    ch,
+                    '*' | '?'
+                        | ':'
+                        | '"'
+                        | '['
+                        | ']'
+                        | '{'
+                        | '}'
+                        | '('
+                        | ')'
+                        | '!'
+                        | '^'
+                        | '~'
+                        | '\\'
+                        | '/'
+                        | '<'
+                        | '>'
+                        | '='
+                )
+            }) {
+                continue;
+            }
+
+            let trimmed =
+                token.trim_matches(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-'));
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            let normalized = trimmed.to_lowercase();
+            if normalized.is_empty() {
+                continue;
+            }
+            if matches!(normalized.as_str(), "and" | "or" | "not") {
+                continue;
+            }
+
+            let mut field_clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+            for field in query_fields {
+                let term = Term::from_field_text(*field, &normalized);
+                field_clauses.push((Occur::Should, Box::new(FuzzyTermQuery::new(term, 1, true))));
+            }
+
+            if !field_clauses.is_empty() {
+                let clause: Box<dyn Query> = if field_clauses.len() == 1 {
+                    field_clauses.into_iter().next().unwrap().1
+                } else {
+                    Box::new(BooleanQuery::from(field_clauses))
+                };
+                clauses.push((Occur::Must, clause));
+            }
+        }
+
+        if clauses.is_empty() {
+            return Ok(base_query);
+        }
+
+        let fuzzy_query: Box<dyn Query> = if clauses.len() == 1 {
+            clauses.into_iter().next().unwrap().1
+        } else {
+            Box::new(BooleanQuery::from(clauses))
+        };
+
+        let mut combined: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+        combined.push((Occur::Should, base_query));
+        combined.push((Occur::Should, fuzzy_query));
+
+        Ok(Box::new(BooleanQuery::from(combined)))
     }
 
     fn compute_aggregation(
@@ -425,7 +661,7 @@ impl SearchEngine {
                 for (_score, doc_address) in top_docs {
                     let doc: TantivyDocument = searcher.doc(doc_address)?;
                     let key: Option<String> =
-                        doc.get_all(field).next().and_then(|value| match value {
+                        doc.get_all(field).next().map(|v| -> tantivy::schema::OwnedValue { v.into() }).and_then(|value| match value {
                             tantivy::schema::OwnedValue::Str(s) => Some(s.to_string()),
                             tantivy::schema::OwnedValue::I64(n) => Some(n.to_string()),
                             tantivy::schema::OwnedValue::U64(n) => Some(n.to_string()),
@@ -463,10 +699,10 @@ impl SearchEngine {
                 for (_score, doc_address) in top_docs {
                     let doc: TantivyDocument = searcher.doc(doc_address)?;
                     let num: Option<f64> =
-                        doc.get_all(field).next().and_then(|value| match value {
-                            tantivy::schema::OwnedValue::I64(n) => Some(*n as f64),
-                            tantivy::schema::OwnedValue::U64(n) => Some(*n as f64),
-                            tantivy::schema::OwnedValue::F64(n) => Some(*n),
+                        doc.get_all(field).next().map(|v| -> tantivy::schema::OwnedValue { v.into() }).and_then(|value| match value {
+                            tantivy::schema::OwnedValue::I64(n) => Some(n as f64),
+                            tantivy::schema::OwnedValue::U64(n) => Some(n as f64),
+                            tantivy::schema::OwnedValue::F64(n) => Some(n),
                             _ => None,
                         });
                     if let Some(n) = num {
@@ -508,10 +744,10 @@ impl SearchEngine {
                 for (_score, doc_address) in top_docs {
                     let doc: TantivyDocument = searcher.doc(doc_address)?;
                     let num: Option<f64> =
-                        doc.get_all(field).next().and_then(|value| match value {
-                            tantivy::schema::OwnedValue::I64(n) => Some(*n as f64),
-                            tantivy::schema::OwnedValue::U64(n) => Some(*n as f64),
-                            tantivy::schema::OwnedValue::F64(n) => Some(*n),
+                        doc.get_all(field).next().map(|v| -> tantivy::schema::OwnedValue { v.into() }).and_then(|value| match value {
+                            tantivy::schema::OwnedValue::I64(n) => Some(n as f64),
+                            tantivy::schema::OwnedValue::U64(n) => Some(n as f64),
+                            tantivy::schema::OwnedValue::F64(n) => Some(n),
                             _ => None,
                         });
                     if let Some(n) = num {
@@ -549,10 +785,10 @@ impl SearchEngine {
                 for (_score, doc_address) in top_docs {
                     let doc: TantivyDocument = searcher.doc(doc_address)?;
                     let num: Option<f64> =
-                        doc.get_all(field).next().and_then(|value| match value {
-                            tantivy::schema::OwnedValue::I64(n) => Some(*n as f64),
-                            tantivy::schema::OwnedValue::U64(n) => Some(*n as f64),
-                            tantivy::schema::OwnedValue::F64(n) => Some(*n),
+                        doc.get_all(field).next().map(|v| -> tantivy::schema::OwnedValue { v.into() }).and_then(|value| match value {
+                            tantivy::schema::OwnedValue::I64(n) => Some(n as f64),
+                            tantivy::schema::OwnedValue::U64(n) => Some(n as f64),
+                            tantivy::schema::OwnedValue::F64(n) => Some(n),
                             _ => None,
                         });
                     if let Some(n) = num {
@@ -647,11 +883,14 @@ impl SearchEngine {
             let doc: TantivyDocument = searcher.doc(doc_address)?;
 
             for field in &query_fields {
-                if let Some(tantivy::schema::OwnedValue::Str(s)) = doc.get_all(*field).next() {
-                    // Check if any word starts with the prefix
-                    for word in s.split_whitespace() {
-                        if word.to_lowercase().starts_with(&prefix.to_lowercase()) {
-                            suggestions.insert(word.to_string());
+                if let Some(field_value) = doc.get_all(*field).next() {
+                    let owned_value: tantivy::schema::OwnedValue = field_value.into();
+                    if let tantivy::schema::OwnedValue::Str(s) = owned_value {
+                        // Check if any word starts with the prefix
+                        for word in s.split_whitespace() {
+                            if word.to_lowercase().starts_with(&prefix.to_lowercase()) {
+                                suggestions.insert(word.to_string());
+                            }
                         }
                     }
                 }

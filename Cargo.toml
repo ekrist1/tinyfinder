@@ -16,7 +16,7 @@ tower = "0.4"
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 
 # Search engine
-tantivy = "0.22"
+tantivy = "0.25"
 
 # Database
 rusqlite = { version = "0.31", features = ["bundled"] }
