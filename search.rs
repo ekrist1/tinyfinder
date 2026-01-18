@@ -38,6 +38,207 @@ impl SearchEngine {
         })
     }
 
+    pub fn load_indices(&self) -> Result<Vec<String>> {
+        let mut loaded = Vec::new();
+        let base_path = Path::new(&self.base_path);
+
+        if !base_path.exists() {
+            return Ok(loaded);
+        }
+
+        for entry in std::fs::read_dir(base_path)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+
+            let index_name = entry.file_name().to_string_lossy().to_string();
+            let index_path = entry.path();
+
+            match Index::open_in_dir(&index_path) {
+                Ok(index) => {
+                    Self::register_analyzers(&index);
+                    let schema = index.schema();
+                    let field_map = schema
+                        .fields()
+                        .map(|(field, field_entry)| (field_entry.name().to_string(), field))
+                        .collect::<HashMap<_, _>>();
+                    let field_configs = Self::field_configs_from_schema(&schema);
+
+                    match index.writer(50_000_000) {
+                        Ok(writer) => {
+                            let handle = IndexHandle {
+                                index,
+                                schema,
+                                writer: Arc::new(RwLock::new(writer)),
+                                field_map,
+                                field_configs,
+                            };
+
+                            match self.indices.write() {
+                                Ok(mut indices) => {
+                                    indices.insert(index_name.clone(), handle);
+                                    loaded.push(index_name);
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Failed to acquire write lock for index '{}': {}",
+                                        index_name,
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to create writer for index '{}': {}",
+                                index_name,
+                                e
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to load index from {}: {}",
+                        index_path.display(),
+                        e
+                    );
+                }
+            }
+        }
+
+        Ok(loaded)
+    }
+
+    pub fn collect_document_ids(&self, index_name: &str) -> Result<Vec<String>> {
+        let indices = self.indices.read()
+            .map_err(|e| anyhow!("Failed to acquire read lock: {}", e))?;
+        let handle = indices
+            .get(index_name)
+            .ok_or_else(|| anyhow!("Index not found: {}", index_name))?;
+
+        let reader = handle
+            .index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::Manual)
+            .try_into()?;
+        let searcher = reader.searcher();
+
+        let id_field = *handle
+            .field_map
+            .get("id")
+            .ok_or_else(|| anyhow!("ID field not found for index: {}", index_name))?;
+
+        let mut ids = Vec::new();
+
+        for segment_reader in searcher.segment_readers() {
+            let store_reader = segment_reader.get_store_reader(0)?;
+            let max_doc = segment_reader.max_doc();
+            let alive_bitset = segment_reader.alive_bitset();
+
+            for doc_id in 0..max_doc {
+                if let Some(bitset) = alive_bitset {
+                    if !bitset.is_alive(doc_id) {
+                        continue;
+                    }
+                }
+
+                let doc: TantivyDocument = store_reader.get(doc_id)?;
+                let id_value = {
+                    let mut values = doc.get_all(id_field);
+                    values.next().and_then(|field_value| {
+                        let owned_value: tantivy::schema::OwnedValue = field_value.into();
+                        if let tantivy::schema::OwnedValue::Str(s) = owned_value {
+                            Some(s.to_string())
+                        } else {
+                            None
+                        }
+                    })
+                };
+
+                if let Some(id) = id_value {
+                    ids.push(id);
+                }
+            }
+        }
+
+        Ok(ids)
+    }
+
+    fn field_configs_from_schema(schema: &Schema) -> Vec<FieldConfig> {
+        let mut configs = Vec::new();
+
+        for (_field, entry) in schema.fields() {
+            let name = entry.name();
+            if name == "id" {
+                continue;
+            }
+
+            match entry.field_type() {
+                FieldType::Str(options) => {
+                    let indexing = options.get_indexing_options();
+                    let indexed = indexing.is_some();
+                    let stored = options.is_stored();
+
+                    let (field_type, analyzer) = if let Some(indexing) = indexing {
+                        let tokenizer = indexing.tokenizer().to_string();
+                        let index_option = indexing.index_option();
+                        let is_string = tokenizer == "raw" && index_option == IndexRecordOption::Basic;
+                        (
+                            if is_string { "string" } else { "text" },
+                            tokenizer,
+                        )
+                    } else {
+                        ("text", "default".to_string())
+                    };
+
+                    configs.push(FieldConfig {
+                        name: name.to_string(),
+                        field_type: field_type.to_string(),
+                        stored,
+                        indexed,
+                        analyzer,
+                        fast: false,
+                    });
+                }
+                FieldType::I64(options) => {
+                    configs.push(FieldConfig {
+                        name: name.to_string(),
+                        field_type: "i64".to_string(),
+                        stored: options.is_stored(),
+                        indexed: options.is_indexed(),
+                        analyzer: "default".to_string(),
+                        fast: options.is_fast(),
+                    });
+                }
+                FieldType::F64(options) => {
+                    configs.push(FieldConfig {
+                        name: name.to_string(),
+                        field_type: "f64".to_string(),
+                        stored: options.is_stored(),
+                        indexed: options.is_indexed(),
+                        analyzer: "default".to_string(),
+                        fast: options.is_fast(),
+                    });
+                }
+                FieldType::Date(options) => {
+                    configs.push(FieldConfig {
+                        name: name.to_string(),
+                        field_type: "date".to_string(),
+                        stored: options.is_stored(),
+                        indexed: options.is_indexed(),
+                        analyzer: "default".to_string(),
+                        fast: options.is_fast(),
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        configs
+    }
+
     fn register_analyzers(index: &Index) {
         // Register Norwegian analyzer with stemming
         let norwegian = TextAnalyzer::builder(SimpleTokenizer::default())
@@ -51,19 +252,7 @@ impl SearchEngine {
         index.tokenizers().register("raw", raw);
     }
 
-    /// Check if an index exists
-    pub fn index_exists(&self, name: &str) -> Result<bool> {
-        let indices = self.indices.read()
-            .map_err(|e| anyhow!("Failed to acquire read lock: {}", e))?;
-        Ok(indices.contains_key(name))
-    }
-
     pub fn create_index(&self, name: &str, fields: &[FieldConfig]) -> Result<()> {
-        // Check if index already exists
-        if self.index_exists(name)? {
-            return Err(anyhow!("Index '{}' already exists", name));
-        }
-
         let mut schema_builder = Schema::builder();
         let mut field_map = HashMap::new();
 
@@ -172,21 +361,19 @@ impl SearchEngine {
 
         self.indices
             .write()
-            .map_err(|e| anyhow!("Failed to acquire write lock: {}", e))?
+            .unwrap()
             .insert(name.to_string(), handle);
 
         Ok(())
     }
 
     pub fn add_documents(&self, index_name: &str, documents: &[Document]) -> Result<()> {
-        let indices = self.indices.read()
-            .map_err(|e| anyhow!("Failed to acquire read lock: {}", e))?;
+        let indices = self.indices.read().unwrap();
         let handle = indices
             .get(index_name)
             .ok_or_else(|| anyhow!("Index not found: {}", index_name))?;
 
-        let mut writer = handle.writer.write()
-            .map_err(|e| anyhow!("Failed to acquire writer lock: {}", e))?;
+        let mut writer = handle.writer.write().unwrap();
 
         for doc in documents {
             let mut tantivy_doc = TantivyDocument::default();
@@ -313,8 +500,7 @@ impl SearchEngine {
     ) -> SearchResult {
         let start = std::time::Instant::now();
 
-        let indices = self.indices.read()
-            .map_err(|e| anyhow!("Failed to acquire read lock: {}", e))?;
+        let indices = self.indices.read().unwrap();
         let handle = indices
             .get(index_name)
             .ok_or_else(|| anyhow!("Index not found: {}", index_name))?;
@@ -403,12 +589,11 @@ impl SearchEngine {
                             // Check if this is a text field
                             let field_entry = handle.schema.get_field_entry(*field);
                             if let FieldType::Str(_) = field_entry.field_type() {
-                                if let Ok(mut snippet_gen) = tantivy::snippet::SnippetGenerator::create(
+                                if let Ok(snippet_gen) = tantivy::snippet::SnippetGenerator::create(
                                     &searcher,
                                     query.as_ref(),
                                     *field,
                                 ) {
-                                    snippet_gen.set_max_num_chars(opts.max_num_chars);
                                     let snippet = snippet_gen.snippet_from_doc(&retrieved_doc);
                                     let html = snippet.to_html();
                                     // Replace default <b> tags with custom tags
@@ -945,8 +1130,7 @@ impl SearchEngine {
     ) -> Result<(Vec<String>, f64)> {
         let start = std::time::Instant::now();
 
-        let indices = self.indices.read()
-            .map_err(|e| anyhow!("Failed to acquire read lock: {}", e))?;
+        let indices = self.indices.read().unwrap();
         let handle = indices
             .get(index_name)
             .ok_or_else(|| anyhow!("Index not found: {}", index_name))?;
@@ -1011,8 +1195,7 @@ impl SearchEngine {
     }
 
     pub fn get_index_stats(&self, index_name: &str, created_at: &str) -> Result<IndexStats> {
-        let indices = self.indices.read()
-            .map_err(|e| anyhow!("Failed to acquire read lock: {}", e))?;
+        let indices = self.indices.read().unwrap();
         let handle = indices
             .get(index_name)
             .ok_or_else(|| anyhow!("Index not found: {}", index_name))?;
@@ -1068,16 +1251,13 @@ impl SearchEngine {
     }
 
     pub fn delete_document(&self, index_name: &str, doc_id: &str) -> Result<()> {
-        let indices = self.indices.read()
-            .map_err(|e| anyhow!("Failed to acquire read lock: {}", e))?;
+        let indices = self.indices.read().unwrap();
         let handle = indices
             .get(index_name)
             .ok_or_else(|| anyhow!("Index not found: {}", index_name))?;
 
-        let mut writer = handle.writer.write()
-            .map_err(|e| anyhow!("Failed to acquire writer lock: {}", e))?;
-        let id_field = handle.field_map.get("id")
-            .ok_or_else(|| anyhow!("ID field not found in index schema"))?;
+        let mut writer = handle.writer.write().unwrap();
+        let id_field = handle.field_map.get("id").unwrap();
 
         writer.delete_term(Term::from_field_text(*id_field, doc_id));
         writer.commit()?;
@@ -1086,8 +1266,7 @@ impl SearchEngine {
     }
 
     pub fn delete_index(&self, index_name: &str) -> Result<()> {
-        let mut indices = self.indices.write()
-            .map_err(|e| anyhow!("Failed to acquire write lock: {}", e))?;
+        let mut indices = self.indices.write().unwrap();
         indices.remove(index_name);
 
         let index_path = Path::new(&self.base_path).join(index_name);
@@ -1099,18 +1278,13 @@ impl SearchEngine {
     }
 
     #[allow(dead_code)]
-    pub fn list_indices(&self) -> Result<Vec<String>> {
-        Ok(self.indices.read()
-            .map_err(|e| anyhow!("Failed to acquire read lock: {}", e))?
-            .keys()
-            .cloned()
-            .collect())
+    pub fn list_indices(&self) -> Vec<String> {
+        self.indices.read().unwrap().keys().cloned().collect()
     }
 
     #[allow(dead_code)]
     pub fn get_document_count(&self, index_name: &str) -> Result<u64> {
-        let indices = self.indices.read()
-            .map_err(|e| anyhow!("Failed to acquire read lock: {}", e))?;
+        let indices = self.indices.read().unwrap();
         let handle = indices
             .get(index_name)
             .ok_or_else(|| anyhow!("Index not found: {}", index_name))?;

@@ -77,12 +77,6 @@ pub struct HighlightOptions {
     pub pre_tag: String,
     #[serde(default = "default_post_tag")]
     pub post_tag: String,
-    #[serde(default = "default_max_num_chars")]
-    pub max_num_chars: usize,
-}
-
-fn default_max_num_chars() -> usize {
-    150
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
@@ -119,7 +113,6 @@ impl Default for HighlightOptions {
             fields: Vec::new(),
             pre_tag: default_pre_tag(),
             post_tag: default_post_tag(),
-            max_num_chars: default_max_num_chars(),
         }
     }
 }

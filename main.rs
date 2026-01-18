@@ -59,6 +59,41 @@ async fn main() -> anyhow::Result<()> {
     let metadata_store = MetadataStore::new(&format!("{}/metadata.db", data_dir))?;
     let search_engine = SearchEngine::new(&format!("{}/indices", data_dir))?;
 
+    let loaded_indices = search_engine.load_indices()?;
+    if loaded_indices.is_empty() {
+        tracing::info!("No existing indices found to load");
+    } else {
+        tracing::info!("Loaded {} index(es): {:?}", loaded_indices.len(), loaded_indices);
+        metadata_store.sync_indices_from_disk(&loaded_indices)?;
+
+        for index_name in &loaded_indices {
+            match search_engine.collect_document_ids(index_name) {
+                Ok(doc_ids) => {
+                    if let Err(e) = metadata_store.reset_index_documents(index_name, &doc_ids) {
+                        tracing::warn!(
+                            "Failed to rebuild metadata documents for index '{}': {}",
+                            index_name,
+                            e
+                        );
+                    } else {
+                        tracing::info!(
+                            "Rebuilt metadata for index '{}' with {} document(s)",
+                            index_name,
+                            doc_ids.len()
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to collect document IDs for index '{}': {}",
+                        index_name,
+                        e
+                    );
+                }
+            }
+        }
+    }
+
     let state = Arc::new(AppState {
         search_engine,
         metadata_store,

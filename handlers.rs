@@ -16,7 +16,6 @@ use crate::AppState;
 pub async fn health_check(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    // Verify database connectivity
     let db_status = match state.metadata_store.health_check() {
         Ok(_) => "healthy",
         Err(_) => "unhealthy",
@@ -47,7 +46,6 @@ pub async fn create_index(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<CreateIndexRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
-    // Validate index name
     validate_index_name(&payload.name)?;
 
     // Set default fields if none provided
@@ -224,7 +222,6 @@ pub async fn search(
         (e.0, Json(ApiResponse::error(e.1.error.clone().unwrap_or_default())))
     })?;
 
-    // Clamp limit to maximum allowed value
     let limit = clamp_pagination_limit(payload.limit);
 
     let (hits, total, took_ms, aggregations) = state
@@ -355,10 +352,7 @@ pub async fn bulk_operation(
                         .add_documents(&index_name, std::slice::from_ref(doc))
                     {
                         Ok(_) => {
-                            // Properly handle metadata errors instead of silently ignoring
-                            if let Err(e) = state.metadata_store.add_document(&index_name, &doc.id) {
-                                tracing::warn!("Failed to update metadata for document {}: {}", doc.id, e);
-                            }
+                            let _ = state.metadata_store.add_document(&index_name, &doc.id);
                             Ok(())
                         }
                         Err(e) => Err(e),
@@ -371,10 +365,7 @@ pub async fn bulk_operation(
                 if let Some(id) = &op.id {
                     match state.search_engine.delete_document(&index_name, id) {
                         Ok(_) => {
-                            // Properly handle metadata errors instead of silently ignoring
-                            if let Err(e) = state.metadata_store.delete_document(id) {
-                                tracing::warn!("Failed to delete metadata for document {}: {}", id, e);
-                            }
+                            let _ = state.metadata_store.delete_document(id);
                             Ok(())
                         }
                         Err(e) => Err(e),

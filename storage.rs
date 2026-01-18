@@ -51,6 +51,27 @@ impl MetadataStore {
         Ok(())
     }
 
+    pub fn sync_indices_from_disk(&self, index_names: &[String]) -> Result<()> {
+        if index_names.is_empty() {
+            return Ok(());
+        }
+
+        let mut conn = self.conn.lock()
+            .map_err(|e| anyhow::anyhow!("Failed to acquire database lock: {}", e))?;
+        let now = Utc::now().to_rfc3339();
+
+        let tx = conn.transaction()?;
+        for name in index_names {
+            tx.execute(
+                "INSERT OR IGNORE INTO indices (name, created_at, updated_at) VALUES (?1, ?2, ?3)",
+                params![name, now, now],
+            )?;
+        }
+        tx.commit()?;
+
+        Ok(())
+    }
+
     pub fn delete_index(&self, name: &str) -> Result<()> {
         let conn = self.conn.lock()
             .map_err(|e| anyhow::anyhow!("Failed to acquire database lock: {}", e))?;
@@ -96,6 +117,32 @@ impl MetadataStore {
             params![doc_id, index_name, now, now],
         )?;
 
+        Ok(())
+    }
+
+    pub fn reset_index_documents(&self, index_name: &str, doc_ids: &[String]) -> Result<()> {
+        let mut conn = self.conn.lock()
+            .map_err(|e| anyhow::anyhow!("Failed to acquire database lock: {}", e))?;
+        let now = Utc::now().to_rfc3339();
+
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM documents WHERE index_name = ?1",
+            params![index_name],
+        )?;
+
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR REPLACE INTO documents (id, index_name, created_at, updated_at) 
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+
+            for doc_id in doc_ids {
+                stmt.execute(params![doc_id, index_name, now, now])?;
+            }
+        }
+
+        tx.commit()?;
         Ok(())
     }
 
