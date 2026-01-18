@@ -195,6 +195,7 @@ pub async fn search(
             payload.highlight.as_ref(),
             &payload.aggregations,
             payload.fuzzy,
+            payload.sort.as_ref(),
         )
         .map_err(|e| {
             (

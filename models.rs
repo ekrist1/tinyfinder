@@ -56,6 +56,8 @@ pub struct SearchRequest {
     #[serde(default)]
     pub fuzzy: bool,
     #[serde(default)]
+    pub sort: Option<SortOption>,
+    #[serde(default)]
     pub highlight: Option<HighlightOptions>,
     #[serde(default)]
     pub aggregations: Vec<AggregationRequest>,
@@ -75,6 +77,32 @@ pub struct HighlightOptions {
     pub pre_tag: String,
     #[serde(default = "default_post_tag")]
     pub post_tag: String,
+    #[serde(default = "default_max_num_chars")]
+    pub max_num_chars: usize,
+}
+
+fn default_max_num_chars() -> usize {
+    150
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "lowercase")]
+pub enum SortOrder {
+    Asc,
+    Desc,
+}
+
+impl Default for SortOrder {
+    fn default() -> Self {
+        SortOrder::Asc
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SortOption {
+    pub field: String,
+    #[serde(default)]
+    pub order: SortOrder,
 }
 
 fn default_true() -> bool {
@@ -96,6 +124,7 @@ impl Default for HighlightOptions {
             fields: Vec::new(),
             pre_tag: default_pre_tag(),
             post_tag: default_post_tag(),
+            max_num_chars: default_max_num_chars(),
         }
     }
 }

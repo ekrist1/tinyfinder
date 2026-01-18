@@ -5,17 +5,17 @@
   },
   "segments": [
     {
-      "segment_id": "2ecc1800-7304-49b2-a042-c622fb0dbaef",
+      "segment_id": "ef68c2ed-12d9-4731-bdb8-80caa880305f",
       "max_doc": 3,
       "deletes": null
     },
     {
-      "segment_id": "832116fd-1360-457e-8960-d62a85913690",
+      "segment_id": "c7c0cdb3-e8ee-4dd8-98a0-bb0e8814d118",
       "max_doc": 1,
       "deletes": null
     },
     {
-      "segment_id": "4f82301f-f8de-4de2-8c17-4ed3926ed5a7",
+      "segment_id": "9df93bf7-6974-4fb8-97b4-2548aec28781",
       "max_doc": 1,
       "deletes": null
     }
@@ -81,6 +81,17 @@
         "fieldnorms": false,
         "fast": false,
         "stored": true
+      }
+    },
+    {
+      "name": "opened_at",
+      "type": "date",
+      "options": {
+        "indexed": true,
+        "fieldnorms": false,
+        "fast": true,
+        "stored": true,
+        "precision": "seconds"
       }
     }
   ],

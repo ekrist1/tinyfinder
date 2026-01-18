@@ -71,14 +71,14 @@ All notable changes to Simple Search Service will be documented in this file.
 ## Roadmap (Future Versions)
 
 ### [0.2.0] - Planned
-- [ ] Norwegian language analyzer
-- [ ] Pagination support in search results
-- [ ] API authentication with tokens
-- [ ] Aggregations and faceted search
-- [ ] Index statistics endpoint
-- [ ] Search suggestions/autocomplete
-- [ ] Highlighting in search results
-- [ ] More field types (dates, geopoints)
+- [x] Norwegian language analyzer
+- [x] Pagination support in search results
+- [x] API authentication with tokens
+- [x] Aggregations and faceted search
+- [x] Index statistics endpoint
+- [x] Search suggestions/autocomplete
+- [x] Highlighting in search results
+- [x] More field types (dates, geopoints)
 
 ### [0.3.0] - Planned
 - [ ] Basic admin web UI

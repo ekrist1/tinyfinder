@@ -6,11 +6,11 @@ use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, FuzzyTermQuery, Occur, Query, QueryParser, RegexQuery};
 use tantivy::schema::*;
 use tantivy::tokenizer::{LowerCaser, SimpleTokenizer, Stemmer, TextAnalyzer};
-use tantivy::{Index, IndexWriter, ReloadPolicy, TantivyDocument, Term};
+use tantivy::{Index, IndexWriter, Order, ReloadPolicy, TantivyDocument, Term};
 
 use crate::models::{
     AggregationBucket, AggregationRequest, AggregationResult, Document, FieldConfig, FieldStats,
-    HighlightOptions, IndexStats, SearchHit, StatsResult,
+    HighlightOptions, IndexStats, SearchHit, SortOption, SortOrder, StatsResult,
 };
 
 pub type SearchResult = Result<(Vec<SearchHit>, usize, f64, Option<Vec<AggregationResult>>)>;
@@ -254,6 +254,7 @@ impl SearchEngine {
             highlight_options,
             aggregations,
             false,
+            None,
         )
     }
 
@@ -268,6 +269,7 @@ impl SearchEngine {
         highlight_options: Option<&HighlightOptions>,
         aggregations: &[AggregationRequest],
         fuzzy: bool,
+        sort: Option<&SortOption>,
     ) -> SearchResult {
         self.search_internal(
             index_name,
@@ -278,6 +280,7 @@ impl SearchEngine {
             highlight_options,
             aggregations,
             fuzzy,
+            sort,
         )
     }
 
@@ -292,6 +295,7 @@ impl SearchEngine {
         highlight_options: Option<&HighlightOptions>,
         aggregations: &[AggregationRequest],
         fuzzy: bool,
+        sort: Option<&SortOption>,
     ) -> SearchResult {
         let start = std::time::Instant::now();
 
@@ -334,11 +338,8 @@ impl SearchEngine {
         // Get total document count that matches the query
         let total = searcher.search(query.as_ref(), &tantivy::collector::Count)?;
 
-        // Fetch offset + limit results, then skip offset
-        let top_docs = searcher.search(query.as_ref(), &TopDocs::with_limit(offset + limit))?;
-
         let mut hits = Vec::new();
-        for (score, doc_address) in top_docs.into_iter().skip(offset) {
+        let mut add_hit = |score: f32, doc_address: tantivy::DocAddress| -> Result<()> {
             let retrieved_doc: TantivyDocument = searcher.doc(doc_address)?;
             let mut field_values = HashMap::new();
 
@@ -387,11 +388,12 @@ impl SearchEngine {
                             // Check if this is a text field
                             let field_entry = handle.schema.get_field_entry(*field);
                             if let FieldType::Str(_) = field_entry.field_type() {
-                                if let Ok(snippet_gen) = tantivy::snippet::SnippetGenerator::create(
+                                if let Ok(mut snippet_gen) = tantivy::snippet::SnippetGenerator::create(
                                     &searcher,
                                     query.as_ref(),
                                     *field,
                                 ) {
+                                    snippet_gen.set_max_num_chars(opts.max_num_chars);
                                     let snippet = snippet_gen.snippet_from_doc(&retrieved_doc);
                                     let html = snippet.to_html();
                                     // Replace default <b> tags with custom tags
@@ -429,6 +431,87 @@ impl SearchEngine {
                 fields: field_values,
                 highlights,
             });
+
+            Ok(())
+        };
+
+        if let Some(sort) = sort {
+            let field_name = sort.field.as_str();
+            let _field = handle
+                .field_map
+                .get(field_name)
+                .ok_or_else(|| anyhow!("Sort field not found: {}", field_name))?;
+            let field_config = handle
+                .field_configs
+                .iter()
+                .find(|fc| fc.name == field_name)
+                .ok_or_else(|| anyhow!("Sort field not found: {}", field_name))?;
+            if !field_config.fast {
+                return Err(anyhow!(
+                    "Sort field '{}' must be configured with fast: true",
+                    field_name
+                ));
+            }
+
+            let order = match sort.order {
+                SortOrder::Asc => Order::Asc,
+                SortOrder::Desc => Order::Desc,
+            };
+
+            match field_config.field_type.as_str() {
+                "i64" => {
+                    let collector = TopDocs::with_limit(limit)
+                        .and_offset(offset)
+                        .order_by_fast_field::<i64>(field_name, order);
+                    let top_docs = searcher.search(query.as_ref(), &collector)?;
+                    for (_sort_value, doc_address) in top_docs {
+                        let score = query
+                            .explain(&searcher, doc_address)
+                            .map(|e| e.value())
+                            .unwrap_or(0.0);
+                        add_hit(score, doc_address)?;
+                    }
+                }
+                "f64" => {
+                    let collector = TopDocs::with_limit(limit)
+                        .and_offset(offset)
+                        .order_by_fast_field::<f64>(field_name, order);
+                    let top_docs = searcher.search(query.as_ref(), &collector)?;
+                    for (_sort_value, doc_address) in top_docs {
+                        let score = query
+                            .explain(&searcher, doc_address)
+                            .map(|e| e.value())
+                            .unwrap_or(0.0);
+                        add_hit(score, doc_address)?;
+                    }
+                }
+                "date" => {
+                    let collector = TopDocs::with_limit(limit)
+                        .and_offset(offset)
+                        .order_by_fast_field::<tantivy::DateTime>(field_name, order);
+                    let top_docs = searcher.search(query.as_ref(), &collector)?;
+                    for (_sort_value, doc_address) in top_docs {
+                        let score = query
+                            .explain(&searcher, doc_address)
+                            .map(|e| e.value())
+                            .unwrap_or(0.0);
+                        add_hit(score, doc_address)?;
+                    }
+                }
+                _ => {
+                    return Err(anyhow!(
+                        "Sorting is only supported on fast i64, f64, or date fields. Field '{}' is type '{}'.",
+                        field_name,
+                        field_config.field_type
+                    ));
+                }
+            }
+        } else {
+            // Fetch offset + limit results, then skip offset
+            let top_docs = searcher.search(query.as_ref(), &TopDocs::with_limit(offset + limit))?;
+            for (score, doc_address) in top_docs.into_iter().skip(offset) {
+                add_hit(score, doc_address)?;
+            }
         }
 
         // Process aggregations

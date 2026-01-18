@@ -44,6 +44,13 @@ curl -s -X POST "$BASE_URL/indices" \
         "field_type": "i64",
         "stored": true,
         "indexed": true
+      },
+      {
+        "name": "opened_at",
+        "field_type": "date",
+        "stored": true,
+        "indexed": true,
+        "fast": true
       }
     ]
   }' | jq '.'
@@ -61,7 +68,8 @@ curl -s -X POST "$BASE_URL/indices/kindergartens/documents" \
           "title": "Smil Barnehage Bergen",
           "description": "Modern barnehage i Bergen sentrum med fokus på læring gjennom lek. Vi har erfarne pedagoger og flotte lokaler.",
           "location": "Bergen",
-          "capacity": 45
+          "capacity": 45,
+          "opened_at": "2021-08-15T09:00:00Z"
         }
       },
       {
@@ -70,7 +78,8 @@ curl -s -X POST "$BASE_URL/indices/kindergartens/documents" \
           "title": "Lekeland Barnehage",
           "description": "Familievennlig barnehage med store uteområder i Fyllingsdalen. Fokus på natur og uteliv.",
           "location": "Bergen",
-          "capacity": 60
+          "capacity": 60,
+          "opened_at": "2019-01-10T08:30:00Z"
         }
       },
       {
@@ -79,7 +88,8 @@ curl -s -X POST "$BASE_URL/indices/kindergartens/documents" \
           "title": "Solstrålen Barnehage Oslo",
           "description": "Internasjonal barnehage i Oslo sentrum. Vi tilbyr tospråklig opplæring og kulturell mangfold.",
           "location": "Oslo",
-          "capacity": 50
+          "capacity": 50,
+          "opened_at": "2020-05-20T10:15:00Z"
         }
       },
       {
@@ -88,7 +98,8 @@ curl -s -X POST "$BASE_URL/indices/kindergartens/documents" \
           "title": "Eventyrskogen Barnehage",
           "description": "Naturbarnehage i Stavanger med mye tid utendørs. Vi følger årstidene og lærer om norsk natur.",
           "location": "Stavanger",
-          "capacity": 40
+          "capacity": 40,
+          "opened_at": "2018-11-05T07:45:00Z"
         }
       },
       {
@@ -97,7 +108,8 @@ curl -s -X POST "$BASE_URL/indices/kindergartens/documents" \
           "title": "Blå Himmel Barnehage Bergen",
           "description": "Nyoppstartet barnehage i Åsane med moderne pedagogikk. Små grupper og personlig oppfølging.",
           "location": "Bergen",
-          "capacity": 35
+          "capacity": 35,
+          "opened_at": "2022-03-01T12:00:00Z"
         }
       }
     ]
@@ -143,8 +155,22 @@ curl -s -X POST "$BASE_URL/indices/kindergartens/search" \
   }' | jq '.'
 echo ""
 
+# Search example 4
+echo "8️⃣  Searching and sorting by opened_at (newest first)..."
+curl -s -X POST "$BASE_URL/indices/kindergartens/search" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "barnehage",
+    "limit": 5,
+    "sort": {
+      "field": "opened_at",
+      "order": "desc"
+    }
+  }' | jq '.'
+echo ""
+
 # Bulk operations
-echo "8️⃣  Performing bulk operations..."
+echo "9️⃣  Performing bulk operations..."
 curl -s -X POST "$BASE_URL/indices/kindergartens/bulk" \
   -H "Content-Type: application/json" \
   -d '{
@@ -157,7 +183,8 @@ curl -s -X POST "$BASE_URL/indices/kindergartens/bulk" \
             "title": "Regnbuen Barnehage",
             "description": "Inkluderende barnehage i Trondheim",
             "location": "Trondheim",
-            "capacity": 55
+            "capacity": 55,
+            "opened_at": "2023-09-12T09:00:00Z"
           }
         }
       },
