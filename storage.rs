@@ -39,7 +39,8 @@ impl MetadataStore {
     }
 
     pub fn create_index(&self, name: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock()
+            .map_err(|e| anyhow::anyhow!("Failed to acquire database lock: {}", e))?;
         let now = Utc::now().to_rfc3339();
 
         conn.execute(
@@ -51,7 +52,8 @@ impl MetadataStore {
     }
 
     pub fn delete_index(&self, name: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock()
+            .map_err(|e| anyhow::anyhow!("Failed to acquire database lock: {}", e))?;
 
         conn.execute("DELETE FROM documents WHERE index_name = ?1", params![name])?;
         conn.execute("DELETE FROM indices WHERE name = ?1", params![name])?;
@@ -60,7 +62,8 @@ impl MetadataStore {
     }
 
     pub fn list_indices(&self) -> Result<Vec<IndexInfo>> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock()
+            .map_err(|e| anyhow::anyhow!("Failed to acquire database lock: {}", e))?;
 
         let mut stmt = conn.prepare(
             "SELECT i.name, i.created_at, COUNT(d.id) as doc_count 
@@ -83,7 +86,8 @@ impl MetadataStore {
     }
 
     pub fn add_document(&self, index_name: &str, doc_id: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock()
+            .map_err(|e| anyhow::anyhow!("Failed to acquire database lock: {}", e))?;
         let now = Utc::now().to_rfc3339();
 
         conn.execute(
@@ -96,14 +100,16 @@ impl MetadataStore {
     }
 
     pub fn delete_document(&self, doc_id: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock()
+            .map_err(|e| anyhow::anyhow!("Failed to acquire database lock: {}", e))?;
         conn.execute("DELETE FROM documents WHERE id = ?1", params![doc_id])?;
         Ok(())
     }
 
     #[allow(dead_code)]
     pub fn get_document_count(&self, index_name: &str) -> Result<u64> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock()
+            .map_err(|e| anyhow::anyhow!("Failed to acquire database lock: {}", e))?;
 
         let count: u64 = conn.query_row(
             "SELECT COUNT(*) FROM documents WHERE index_name = ?1",
@@ -112,5 +118,15 @@ impl MetadataStore {
         )?;
 
         Ok(count)
+    }
+
+    /// Health check - verifies database connectivity
+    pub fn health_check(&self) -> Result<()> {
+        let conn = self.conn.lock()
+            .map_err(|e| anyhow::anyhow!("Failed to acquire database lock: {}", e))?;
+
+        // Simple query to verify database is responsive
+        conn.query_row("SELECT 1", [], |_| Ok(()))?;
+        Ok(())
     }
 }

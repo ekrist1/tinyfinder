@@ -50,16 +50,37 @@ The service will start on `http://localhost:3000`
 GET /health
 ```
 
-Response:
+Response (healthy):
 ```json
 {
   "status": "healthy",
   "service": "simple-search-service",
-  "version": "0.1.0"
+  "version": "0.2.0",
+  "checks": {
+    "database": "healthy"
+  }
+}
+```
+
+Response (unhealthy - returns HTTP 503):
+```json
+{
+  "status": "unhealthy",
+  "service": "simple-search-service",
+  "version": "0.2.0",
+  "checks": {
+    "database": "unhealthy"
+  }
 }
 ```
 
 ### Create Index
+
+**Index name requirements:**
+- Must start with a letter (a-z, A-Z)
+- Can contain letters, numbers, underscores, and hyphens
+- Maximum 64 characters
+- Cannot contain path separators or `..`
 
 ```bash
 POST /indices
@@ -352,6 +373,28 @@ Environment variables:
 - `DATA_DIR`: Data directory path (default: `./data`)
 - `PORT`: Server port (default: `3000`)
 - `RUST_LOG`: Log level (default: `info`, options: `trace`, `debug`, `info`, `warn`, `error`)
+- `API_TOKENS`: Comma-separated list of API tokens for authentication (optional, protects write endpoints)
+- `CORS_ORIGINS`: Comma-separated list of allowed CORS origins (default: `*` allows all origins)
+
+### CORS Configuration
+
+For production, configure specific origins:
+
+```bash
+export CORS_ORIGINS="https://app.example.com,https://admin.example.com"
+```
+
+### API Limits
+
+The service enforces the following limits to prevent abuse:
+
+| Limit | Value | Description |
+|-------|-------|-------------|
+| Request body size | 10 MB | Maximum size of JSON payloads |
+| Documents per request | 1,000 | Maximum documents in `POST /indices/:name/documents` |
+| Bulk operations | 1,000 | Maximum operations in `POST /indices/:name/bulk` |
+| Pagination limit | 1,000 | Maximum `limit` parameter (silently capped) |
+| Index name length | 64 chars | Maximum length for index names |
 
 ## Performance Tips
 
@@ -391,6 +434,8 @@ User=search
 WorkingDirectory=/opt/search-service
 Environment="DATA_DIR=/var/lib/search-service"
 Environment="PORT=3000"
+Environment="CORS_ORIGINS=https://app.example.com"
+Environment="API_TOKENS=your-secret-token"
 ExecStart=/opt/search-service/simple-search-service
 Restart=always
 RestartSec=10

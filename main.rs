@@ -1,17 +1,20 @@
 use axum::{
+    extract::DefaultBodyLimit,
     middleware,
     routing::{delete, get, post},
     Router,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
+use tower_http::trace::TraceLayer;
 
 mod auth;
 mod handlers;
 mod models;
 mod search;
 mod storage;
+mod validation;
 
 use search::SearchEngine;
 use storage::MetadataStore;
@@ -85,11 +88,16 @@ async fn main() -> anyhow::Result<()> {
             auth::auth_middleware,
         ));
 
+    // Configure CORS based on environment
+    let cors_layer = build_cors_layer();
+
     // Combine routes
     let app = Router::new()
         .merge(public_routes)
         .merge(protected_routes)
-        .layer(CorsLayer::permissive())
+        .layer(cors_layer)
+        .layer(TraceLayer::new_for_http())
+        .layer(DefaultBodyLimit::max(validation::MAX_REQUEST_BODY_SIZE))
         .with_state(state);
 
     let port = std::env::var("PORT")
@@ -101,7 +109,82 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
 
+    // Graceful shutdown handling
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+
+    tracing::info!("Server shutdown complete");
     Ok(())
+}
+
+/// Build CORS layer based on CORS_ORIGINS environment variable
+fn build_cors_layer() -> CorsLayer {
+    let origins = std::env::var("CORS_ORIGINS").unwrap_or_default();
+
+    if origins.is_empty() || origins == "*" {
+        tracing::warn!("CORS_ORIGINS not set or set to '*' - allowing all origins (not recommended for production)");
+        CorsLayer::permissive()
+    } else {
+        let allowed_origins: Vec<_> = origins
+            .split(',')
+            .filter_map(|s| {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    trimmed.parse().ok()
+                }
+            })
+            .collect();
+
+        if allowed_origins.is_empty() {
+            tracing::warn!("No valid CORS origins parsed, falling back to permissive");
+            CorsLayer::permissive()
+        } else {
+            tracing::info!("CORS configured for {} origin(s)", allowed_origins.len());
+            CorsLayer::new()
+                .allow_origin(AllowOrigin::list(allowed_origins))
+                .allow_methods([
+                    axum::http::Method::GET,
+                    axum::http::Method::POST,
+                    axum::http::Method::DELETE,
+                    axum::http::Method::OPTIONS,
+                ])
+                .allow_headers([
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::header::AUTHORIZATION,
+                ])
+        }
+    }
+}
+
+/// Graceful shutdown signal handler
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("Failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {
+            tracing::info!("Received Ctrl+C, initiating graceful shutdown...");
+        }
+        _ = terminate => {
+            tracing::info!("Received SIGTERM, initiating graceful shutdown...");
+        }
+    }
 }

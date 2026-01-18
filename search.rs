@@ -51,7 +51,19 @@ impl SearchEngine {
         index.tokenizers().register("raw", raw);
     }
 
+    /// Check if an index exists
+    pub fn index_exists(&self, name: &str) -> Result<bool> {
+        let indices = self.indices.read()
+            .map_err(|e| anyhow!("Failed to acquire read lock: {}", e))?;
+        Ok(indices.contains_key(name))
+    }
+
     pub fn create_index(&self, name: &str, fields: &[FieldConfig]) -> Result<()> {
+        // Check if index already exists
+        if self.index_exists(name)? {
+            return Err(anyhow!("Index '{}' already exists", name));
+        }
+
         let mut schema_builder = Schema::builder();
         let mut field_map = HashMap::new();
 
@@ -160,19 +172,21 @@ impl SearchEngine {
 
         self.indices
             .write()
-            .unwrap()
+            .map_err(|e| anyhow!("Failed to acquire write lock: {}", e))?
             .insert(name.to_string(), handle);
 
         Ok(())
     }
 
     pub fn add_documents(&self, index_name: &str, documents: &[Document]) -> Result<()> {
-        let indices = self.indices.read().unwrap();
+        let indices = self.indices.read()
+            .map_err(|e| anyhow!("Failed to acquire read lock: {}", e))?;
         let handle = indices
             .get(index_name)
             .ok_or_else(|| anyhow!("Index not found: {}", index_name))?;
 
-        let mut writer = handle.writer.write().unwrap();
+        let mut writer = handle.writer.write()
+            .map_err(|e| anyhow!("Failed to acquire writer lock: {}", e))?;
 
         for doc in documents {
             let mut tantivy_doc = TantivyDocument::default();
@@ -299,7 +313,8 @@ impl SearchEngine {
     ) -> SearchResult {
         let start = std::time::Instant::now();
 
-        let indices = self.indices.read().unwrap();
+        let indices = self.indices.read()
+            .map_err(|e| anyhow!("Failed to acquire read lock: {}", e))?;
         let handle = indices
             .get(index_name)
             .ok_or_else(|| anyhow!("Index not found: {}", index_name))?;
@@ -612,7 +627,7 @@ impl SearchEngine {
                 // If fuzzy is enabled, also add fuzzy queries for the non-wildcard part
                 if fuzzy {
                     // Extract the prefix (part before the first wildcard)
-                    let prefix = pattern.split(|c| c == '*' || c == '?').next().unwrap_or("");
+                    let prefix = pattern.split(['*', '?']).next().unwrap_or("");
                     if !prefix.is_empty() && prefix.len() >= 2 {
                         let mut fuzzy_clauses: Vec<(Occur, Box<dyn Query>)> = vec![
                             (Occur::Should, wildcard_query)
@@ -716,9 +731,10 @@ impl SearchEngine {
             Box::new(BooleanQuery::from(clauses))
         };
 
-        let mut combined: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-        combined.push((Occur::Should, base_query));
-        combined.push((Occur::Should, fuzzy_query));
+        let combined: Vec<(Occur, Box<dyn Query>)> = vec![
+            (Occur::Should, base_query),
+            (Occur::Should, fuzzy_query),
+        ];
 
         Ok(Box::new(BooleanQuery::from(combined)))
     }
@@ -929,7 +945,8 @@ impl SearchEngine {
     ) -> Result<(Vec<String>, f64)> {
         let start = std::time::Instant::now();
 
-        let indices = self.indices.read().unwrap();
+        let indices = self.indices.read()
+            .map_err(|e| anyhow!("Failed to acquire read lock: {}", e))?;
         let handle = indices
             .get(index_name)
             .ok_or_else(|| anyhow!("Index not found: {}", index_name))?;
@@ -994,7 +1011,8 @@ impl SearchEngine {
     }
 
     pub fn get_index_stats(&self, index_name: &str, created_at: &str) -> Result<IndexStats> {
-        let indices = self.indices.read().unwrap();
+        let indices = self.indices.read()
+            .map_err(|e| anyhow!("Failed to acquire read lock: {}", e))?;
         let handle = indices
             .get(index_name)
             .ok_or_else(|| anyhow!("Index not found: {}", index_name))?;
@@ -1050,13 +1068,16 @@ impl SearchEngine {
     }
 
     pub fn delete_document(&self, index_name: &str, doc_id: &str) -> Result<()> {
-        let indices = self.indices.read().unwrap();
+        let indices = self.indices.read()
+            .map_err(|e| anyhow!("Failed to acquire read lock: {}", e))?;
         let handle = indices
             .get(index_name)
             .ok_or_else(|| anyhow!("Index not found: {}", index_name))?;
 
-        let mut writer = handle.writer.write().unwrap();
-        let id_field = handle.field_map.get("id").unwrap();
+        let mut writer = handle.writer.write()
+            .map_err(|e| anyhow!("Failed to acquire writer lock: {}", e))?;
+        let id_field = handle.field_map.get("id")
+            .ok_or_else(|| anyhow!("ID field not found in index schema"))?;
 
         writer.delete_term(Term::from_field_text(*id_field, doc_id));
         writer.commit()?;
@@ -1065,7 +1086,8 @@ impl SearchEngine {
     }
 
     pub fn delete_index(&self, index_name: &str) -> Result<()> {
-        let mut indices = self.indices.write().unwrap();
+        let mut indices = self.indices.write()
+            .map_err(|e| anyhow!("Failed to acquire write lock: {}", e))?;
         indices.remove(index_name);
 
         let index_path = Path::new(&self.base_path).join(index_name);
@@ -1077,13 +1099,18 @@ impl SearchEngine {
     }
 
     #[allow(dead_code)]
-    pub fn list_indices(&self) -> Vec<String> {
-        self.indices.read().unwrap().keys().cloned().collect()
+    pub fn list_indices(&self) -> Result<Vec<String>> {
+        Ok(self.indices.read()
+            .map_err(|e| anyhow!("Failed to acquire read lock: {}", e))?
+            .keys()
+            .cloned()
+            .collect())
     }
 
     #[allow(dead_code)]
     pub fn get_document_count(&self, index_name: &str) -> Result<u64> {
-        let indices = self.indices.read().unwrap();
+        let indices = self.indices.read()
+            .map_err(|e| anyhow!("Failed to acquire read lock: {}", e))?;
         let handle = indices
             .get(index_name)
             .ok_or_else(|| anyhow!("Index not found: {}", index_name))?;

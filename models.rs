@@ -85,17 +85,12 @@ fn default_max_num_chars() -> usize {
     150
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "lowercase")]
 pub enum SortOrder {
+    #[default]
     Asc,
     Desc,
-}
-
-impl Default for SortOrder {
-    fn default() -> Self {
-        SortOrder::Asc
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
