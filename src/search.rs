@@ -534,10 +534,24 @@ impl SearchEngine {
                 .collect()
         };
 
-        let query = Self::build_query(handle, query_str, &query_fields, fuzzy)?;
+        let mut query = Self::build_query(handle, query_str, &query_fields, fuzzy)?;
 
         // Get total document count that matches the query
-        let total = searcher.search(query.as_ref(), &tantivy::collector::Count)?;
+        let mut total = searcher.search(query.as_ref(), &tantivy::collector::Count)?;
+
+        // Fallback: if no hits, try a keyword-only query (removes question/stop words)
+        if total == 0 {
+            if let Some(fallback_query) = Self::fallback_query_string(query_str) {
+                if fallback_query != query_str {
+                    let fallback = Self::build_query(handle, &fallback_query, &query_fields, fuzzy)?;
+                    let fallback_total = searcher.search(fallback.as_ref(), &tantivy::collector::Count)?;
+                    if fallback_total > 0 {
+                        query = fallback;
+                        total = fallback_total;
+                    }
+                }
+            }
+        }
 
         let mut hits = Vec::new();
         let mut add_hit = |score: f32, doc_address: tantivy::DocAddress| -> Result<()> {
@@ -922,6 +936,36 @@ impl SearchEngine {
         ];
 
         Ok(Box::new(BooleanQuery::from(combined)))
+    }
+
+    fn fallback_query_string(query_str: &str) -> Option<String> {
+        let stopwords: HashSet<&'static str> = [
+            "hva", "hvem", "hvor", "hvilken", "hvilke", "hvordan", "når", "hvorfor",
+            "what", "who", "where", "which", "how", "when", "why",
+            "er", "var", "bli", "blir", "være",
+            "og", "eller", "for", "av", "til", "med", "i", "på", "om", "som",
+            "en", "et", "den", "det", "de", "du", "jeg", "vi", "oss",
+        ]
+        .into_iter()
+        .collect();
+
+        let cleaned: String = query_str
+            .to_lowercase()
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '_' || c == '-' { c } else { ' ' })
+            .collect();
+
+        let tokens: Vec<String> = cleaned
+            .split_whitespace()
+            .filter(|token| token.len() > 1 && !stopwords.contains(*token))
+            .map(|token| token.to_string())
+            .collect();
+
+        if tokens.is_empty() {
+            None
+        } else {
+            Some(tokens.join(" "))
+        }
     }
 
     fn compute_aggregation(

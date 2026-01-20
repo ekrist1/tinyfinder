@@ -11,6 +11,7 @@ use tower_http::trace::TraceLayer;
 
 mod auth;
 mod handlers;
+mod llm;
 mod models;
 mod search;
 mod storage;
@@ -18,11 +19,13 @@ mod validation;
 
 use search::SearchEngine;
 use storage::MetadataStore;
+use llm::LlmClient;
 
 pub struct AppState {
     search_engine: SearchEngine,
     metadata_store: MetadataStore,
     api_tokens: Vec<String>,
+    llm_client: Option<LlmClient>,
 }
 
 #[tokio::main]
@@ -34,6 +37,9 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     tracing::info!("Starting Simple Search Service v0.2.0");
+
+    // Load environment variables from .env if present
+    dotenvy::dotenv().ok();
 
     // Initialize storage
     let data_dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "./data".to_string());
@@ -58,6 +64,13 @@ async fn main() -> anyhow::Result<()> {
 
     let metadata_store = MetadataStore::new(&format!("{}/metadata.db", data_dir))?;
     let search_engine = SearchEngine::new(&format!("{}/indices", data_dir))?;
+    let llm_client = LlmClient::from_env();
+
+    if llm_client.is_none() {
+        tracing::warn!(
+            "MISTRAL_API_KEY not set - generative answer endpoint disabled"
+        );
+    }
 
     let loaded_indices = search_engine.load_indices()?;
     if loaded_indices.is_empty() {
@@ -98,6 +111,7 @@ async fn main() -> anyhow::Result<()> {
         search_engine,
         metadata_store,
         api_tokens,
+        llm_client,
     });
 
     // Public routes (no authentication required)
@@ -105,6 +119,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/health", get(handlers::health_check))
         .route("/indices", get(handlers::list_indices))
         .route("/indices/:name/search", post(handlers::search))
+        .route("/indices/:name/answer", post(handlers::answer))
         .route("/indices/:name/stats", get(handlers::get_index_stats))
         .route("/indices/:name/suggest", post(handlers::suggest));
 

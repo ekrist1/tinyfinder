@@ -179,6 +179,39 @@ pub struct SearchHit {
     pub highlights: Option<HashMap<String, Vec<String>>>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AnswerRequest {
+    pub query: String,
+    #[serde(default = "default_answer_limit")]
+    pub search_limit: usize,
+    #[serde(default)]
+    pub fields: Vec<String>,
+    #[serde(default)]
+    pub fuzzy: bool,
+    #[serde(default = "default_true")]
+    pub stream: bool,
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+}
+
+fn default_answer_limit() -> usize {
+    5
+}
+
+#[derive(Debug, Serialize)]
+pub struct AnswerResponse {
+    pub answer: String,
+    pub model: String,
+    pub search_took_ms: f64,
+    pub llm_took_ms: f64,
+    pub total_took_ms: f64,
+    pub sources: Vec<SearchHit>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct IndexInfo {
     pub name: String,

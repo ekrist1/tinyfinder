@@ -9,6 +9,7 @@ A lightweight, powerful full-text search service built with Rust, Tantivy, and S
 - 🔌 **RESTful API**: Easy integration with any application
 - 🐳 **Easy Deploy**: Single binary or Docker container
 - 🔍 **Full-Text Search**: BM25 ranking, phrase queries, fuzzy matching
+- 🤖 **Generative Answers**: Mistral-powered, source-grounded responses (optional)
 - 🌍 **Multi-language**: Supports Norwegian, English, and more
 - 📊 **Lightweight**: Runs on 512MB RAM
 
@@ -26,6 +27,8 @@ docker-compose up -d
 # Check health
 curl http://localhost:3000/health
 ```
+
+Docker Compose loads environment variables from `.env` (see `env_file` in `docker-compose.yml`).
 
 ### Option 2: Build from Source
 
@@ -229,6 +232,61 @@ To sort by a date field, define the field as `"field_type": "date"` and set `"fa
 
 Supported sort field types: `i64`, `f64`, `date` (must be `fast: true`).
 
+### Generative Answers (Mistral)
+
+This endpoint runs a search, then asks Mistral to summarize the top hits into a grounded answer.
+If `stream` is `true` (default), the response is an SSE stream.
+
+```bash
+POST /indices/products/answer
+Content-Type: application/json
+
+{
+  "query": "hvor er familievennlig barnehage",
+  "search_limit": 5,
+  "fields": ["title", "description", "location"],
+  "fuzzy": true,
+  "stream": false,
+  "temperature": 0.2
+}
+```
+
+Response (non-streaming):
+```json
+{
+  "success": true,
+  "data": {
+    "answer": "...",
+    "model": "mistral-large-latest",
+    "search_took_ms": 3.1,
+    "llm_took_ms": 412.7,
+    "total_took_ms": 418.5,
+    "sources": [
+      {
+        "id": "kg_001",
+        "score": 8.42,
+        "fields": {
+          "title": "Lekeland Barnehage",
+          "description": "Familievennlig barnehage ..."
+        }
+      }
+    ]
+  }
+}
+```
+
+Streaming (SSE) example:
+```bash
+curl -N http://localhost:3000/indices/kindergartens/answer \
+  -H "Content-Type: application/json" \
+  -d '{"query":"hvor er familievennlig barnehage","stream":true}'
+```
+
+The stream emits:
+- `event: meta` with JSON containing `model`, `search_took_ms`, and `sources`
+- `data:` chunks with partial answer text
+- `event: done` when finished
+
 #### Highlighting
 
 To highlight search terms in the results, set `"highlight": true` in the search payload. This will wrap matching terms in `<em>` tags.
@@ -375,6 +433,9 @@ Environment variables:
 - `RUST_LOG`: Log level (default: `info`, options: `trace`, `debug`, `info`, `warn`, `error`)
 - `API_TOKENS`: Comma-separated list of API tokens for authentication (optional, protects write endpoints)
 - `CORS_ORIGINS`: Comma-separated list of allowed CORS origins (default: `*` allows all origins)
+- `MISTRAL_API_KEY`: API key for Mistral (enables `/indices/:name/answer`)
+- `MISTRAL_MODEL`: Mistral model name (default: `mistral-large-latest`)
+- `MISTRAL_BASE_URL`: Base URL for Mistral-compatible API (default: `https://api.mistral.ai/v1`)
 
 ### CORS Configuration
 

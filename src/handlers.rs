@@ -1,11 +1,15 @@
 use axum::{
     extract::{Path, State},
     http::StatusCode,
-    response::IntoResponse,
+    response::{sse::{Event, KeepAlive, Sse}, IntoResponse, Response},
     Json,
 };
+use futures_util::StreamExt;
+use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use crate::llm::{ChatCompletionRequest, ChatCompletionStreamChunk, ChatMessage};
 use crate::models::*;
 use crate::validation::{
     clamp_pagination_limit, validate_bulk_operation_count, validate_document_count,
@@ -257,6 +261,198 @@ pub async fn search(
     };
 
     Ok(Json(ApiResponse::success(response)))
+}
+
+pub async fn answer(
+    State(state): State<Arc<AppState>>,
+    Path(index_name): Path<String>,
+    Json(payload): Json<AnswerRequest>,
+) -> Result<Response, (StatusCode, Json<ApiResponse<()>>)> {
+    validate_index_name(&index_name).map_err(|e| {
+        (e.0, Json(ApiResponse::error(e.1.error.clone().unwrap_or_default())))
+    })?;
+
+    let llm_client = match state.llm_client.clone() {
+        Some(client) => client,
+        None => {
+            return Err((
+                StatusCode::NOT_IMPLEMENTED,
+                Json(ApiResponse::error(
+                    "MISTRAL_API_KEY not configured".to_string(),
+                )),
+            ))
+        }
+    };
+
+    let limit = clamp_pagination_limit(payload.search_limit);
+    let total_start = Instant::now();
+
+    let (hits, _total, search_took_ms, _aggregations) = state
+        .search_engine
+        .search_with_options(
+            &index_name,
+            &payload.query,
+            limit,
+            0,
+            &payload.fields,
+            None,
+            &[],
+            payload.fuzzy,
+            None,
+        )
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::error(e.to_string())),
+            )
+        })?;
+
+    let mut sources_lines = Vec::new();
+    for (idx, hit) in hits.iter().enumerate() {
+        let fields_json = serde_json::to_string(&hit.fields).unwrap_or_default();
+        sources_lines.push(format!(
+            "[{}] id={} score={:.3} fields={}",
+            idx + 1,
+            hit.id,
+            hit.score,
+            fields_json
+        ));
+    }
+
+    let sources_text = if sources_lines.is_empty() {
+        "No sources found.".to_string()
+    } else {
+        sources_lines.join("\n")
+    };
+
+    let system_prompt = payload.system_prompt.unwrap_or_else(|| {
+        "You are a helpful assistant. Answer the user's question using only the provided sources. If the answer is not contained in the sources, say you don't know. Use the input language for your answer.".to_string()
+    });
+
+    let user_prompt = format!(
+        "Question: {}\n\nSources:\n{}",
+        payload.query, sources_text
+    );
+
+    let messages = vec![
+        ChatMessage {
+            role: "system".to_string(),
+            content: system_prompt,
+        },
+        ChatMessage {
+            role: "user".to_string(),
+            content: user_prompt,
+        },
+    ];
+
+    let llm_request = ChatCompletionRequest {
+        model: llm_client.model().to_string(),
+        messages,
+        temperature: payload.temperature,
+        max_tokens: payload.max_tokens,
+        stream: payload.stream,
+    };
+
+    if payload.stream {
+        let response = llm_client.stream(llm_request).await.map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(ApiResponse::error(e.to_string())),
+            )
+        })?;
+
+        let model = llm_client.model().to_string();
+        let meta = serde_json::json!({
+            "model": model,
+            "search_took_ms": search_took_ms,
+            "sources": hits,
+        });
+
+        let stream = async_stream::stream! {
+            yield Ok::<Event, Infallible>(Event::default().event("meta").data(meta.to_string()));
+
+            let mut buffer = String::new();
+            let mut bytes_stream = response.bytes_stream();
+
+            while let Some(chunk) = bytes_stream.next().await {
+                match chunk {
+                    Ok(bytes) => {
+                        buffer.push_str(&String::from_utf8_lossy(&bytes));
+                        while let Some(pos) = buffer.find('\n') {
+                            let line = buffer[..pos].trim_end().to_string();
+                            buffer = buffer[pos + 1..].to_string();
+
+                            let trimmed = line.trim();
+                            if trimmed.is_empty() {
+                                continue;
+                            }
+
+                            if let Some(data) = trimmed.strip_prefix("data:") {
+                                let data = data.trim();
+                                if data == "[DONE]" {
+                                    yield Ok::<Event, Infallible>(Event::default().event("done").data(""));
+                                    return;
+                                }
+
+                                match serde_json::from_str::<ChatCompletionStreamChunk>(data) {
+                                    Ok(chunk) => {
+                                        for choice in chunk.choices {
+                                            if let Some(content) = choice.delta.content {
+                                                yield Ok::<Event, Infallible>(Event::default().data(content));
+                                            }
+                                        }
+                                    }
+                                    Err(err) => {
+                                        yield Ok::<Event, Infallible>(Event::default().event("error").data(format!("Invalid stream payload: {}", err)));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        yield Ok::<Event, Infallible>(Event::default().event("error").data(format!("Stream error: {}", err)));
+                        return;
+                    }
+                }
+            }
+        };
+
+        let sse = Sse::new(stream).keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keep-alive"),
+        );
+
+        return Ok(sse.into_response());
+    }
+
+    let llm_start = Instant::now();
+    let response = llm_client.complete(llm_request).await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(ApiResponse::error(e.to_string())),
+        )
+    })?;
+
+    let answer = response
+        .choices
+        .first()
+        .map(|choice| choice.message.content.clone())
+        .unwrap_or_default();
+
+    let llm_took_ms = llm_start.elapsed().as_secs_f64() * 1000.0;
+    let total_took_ms = total_start.elapsed().as_secs_f64() * 1000.0;
+
+    let response = AnswerResponse {
+        answer,
+        model: llm_client.model().to_string(),
+        search_took_ms,
+        llm_took_ms,
+        total_took_ms,
+        sources: hits,
+    };
+
+    Ok(Json(ApiResponse::success(response)).into_response())
 }
 
 pub async fn get_index_stats(
