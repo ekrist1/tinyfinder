@@ -61,6 +61,9 @@ pub struct SearchRequest {
     pub highlight: Option<HighlightOptions>,
     #[serde(default)]
     pub aggregations: Vec<AggregationRequest>,
+    /// Minimum number of SHOULD clauses that must match (for BooleanQuery)
+    #[serde(default)]
+    pub minimum_should_match: Option<usize>,
 }
 
 fn default_limit() -> usize {
@@ -136,27 +139,8 @@ pub struct RangeSpec {
     pub to: Option<f64>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct AggregationResult {
-    pub name: String,
-    pub buckets: Option<Vec<AggregationBucket>>,
-    pub stats: Option<StatsResult>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct AggregationBucket {
-    pub key: serde_json::Value,
-    pub doc_count: u64,
-}
-
-#[derive(Debug, Serialize)]
-pub struct StatsResult {
-    pub count: u64,
-    pub sum: f64,
-    pub avg: Option<f64>,
-    pub min: Option<f64>,
-    pub max: Option<f64>,
-}
+// Note: Old aggregation types kept for backwards compatibility reference
+// The API now uses Tantivy's built-in AggregationResults type which is Elasticsearch-compatible
 
 #[derive(Debug, Serialize)]
 pub struct SearchResponse {
@@ -167,7 +151,7 @@ pub struct SearchResponse {
     pub has_more: bool,
     pub hits: Vec<SearchHit>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub aggregations: Option<Vec<AggregationResult>>,
+    pub aggregations: Option<tantivy::aggregation::agg_result::AggregationResults>,
 }
 
 #[derive(Debug, Serialize)]
@@ -302,4 +286,46 @@ fn default_suggest_limit() -> usize {
 pub struct SuggestResponse {
     pub suggestions: Vec<String>,
     pub took_ms: f64,
+}
+
+/// Synonym group - all terms in the group are treated as equivalent
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SynonymGroup {
+    /// List of terms that are synonyms of each other
+    pub terms: Vec<String>,
+}
+
+/// Request to add synonyms to an index
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AddSynonymsRequest {
+    /// List of synonym groups
+    pub synonyms: Vec<SynonymGroup>,
+}
+
+/// Response for synonym operations
+#[derive(Debug, Serialize)]
+pub struct SynonymsResponse {
+    pub synonyms: Vec<SynonymGroup>,
+}
+
+/// Pinned result rule - promote specific documents for specific queries
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PinnedRule {
+    /// Query terms that trigger this rule (case-insensitive, matches if query contains any term)
+    pub queries: Vec<String>,
+    /// Document IDs to pin to the top (in order)
+    pub document_ids: Vec<String>,
+}
+
+/// Request to add pinned rules to an index
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AddPinnedRulesRequest {
+    /// List of pinned rules
+    pub rules: Vec<PinnedRule>,
+}
+
+/// Response for pinned rules operations
+#[derive(Debug, Serialize)]
+pub struct PinnedRulesResponse {
+    pub rules: Vec<PinnedRule>,
 }

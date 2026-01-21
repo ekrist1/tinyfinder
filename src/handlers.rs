@@ -240,6 +240,7 @@ pub async fn search(
             &payload.aggregations,
             payload.fuzzy,
             payload.sort.as_ref(),
+            payload.minimum_should_match,
         )
         .map_err(|e| {
             (
@@ -299,6 +300,7 @@ pub async fn answer(
             &[],
             payload.fuzzy,
             None,
+            None, // minimum_should_match not needed for generative search
         )
         .map_err(|e| {
             (
@@ -590,4 +592,130 @@ pub async fn bulk_operation(
     };
 
     Ok(Json(ApiResponse::success(response)))
+}
+
+/// Add synonyms to an index
+pub async fn add_synonyms(
+    State(state): State<Arc<AppState>>,
+    Path(index_name): Path<String>,
+    Json(payload): Json<AddSynonymsRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    validate_index_name(&index_name).map_err(|e| {
+        (e.0, Json(ApiResponse::error(e.1.error.clone().unwrap_or_default())))
+    })?;
+
+    state
+        .search_engine
+        .add_synonyms(&index_name, payload.synonyms)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::error(e.to_string())),
+            )
+        })?;
+
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "message": "Synonyms added successfully"
+    }))))
+}
+
+/// Get synonyms for an index
+pub async fn get_synonyms(
+    State(state): State<Arc<AppState>>,
+    Path(index_name): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    validate_index_name(&index_name).map_err(|e| {
+        (e.0, Json(ApiResponse::error(e.1.error.clone().unwrap_or_default())))
+    })?;
+
+    let synonyms = state.search_engine.get_synonyms(&index_name);
+
+    Ok(Json(ApiResponse::success(SynonymsResponse { synonyms })))
+}
+
+/// Clear all synonyms for an index
+pub async fn clear_synonyms(
+    State(state): State<Arc<AppState>>,
+    Path(index_name): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    validate_index_name(&index_name).map_err(|e| {
+        (e.0, Json(ApiResponse::error(e.1.error.clone().unwrap_or_default())))
+    })?;
+
+    state
+        .search_engine
+        .clear_synonyms(&index_name)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::error(e.to_string())),
+            )
+        })?;
+
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "message": "Synonyms cleared successfully"
+    }))))
+}
+
+/// Add pinned rules to an index
+pub async fn add_pinned_rules(
+    State(state): State<Arc<AppState>>,
+    Path(index_name): Path<String>,
+    Json(payload): Json<AddPinnedRulesRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    validate_index_name(&index_name).map_err(|e| {
+        (e.0, Json(ApiResponse::error(e.1.error.clone().unwrap_or_default())))
+    })?;
+
+    state
+        .search_engine
+        .add_pinned_rules(&index_name, payload.rules)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::error(e.to_string())),
+            )
+        })?;
+
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "message": "Pinned rules added successfully"
+    }))))
+}
+
+/// Get pinned rules for an index
+pub async fn get_pinned_rules(
+    State(state): State<Arc<AppState>>,
+    Path(index_name): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    validate_index_name(&index_name).map_err(|e| {
+        (e.0, Json(ApiResponse::error(e.1.error.clone().unwrap_or_default())))
+    })?;
+
+    let rules = state.search_engine.get_pinned_rules(&index_name);
+
+    Ok(Json(ApiResponse::success(PinnedRulesResponse { rules })))
+}
+
+/// Clear all pinned rules for an index
+pub async fn clear_pinned_rules(
+    State(state): State<Arc<AppState>>,
+    Path(index_name): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<()>>)> {
+    validate_index_name(&index_name).map_err(|e| {
+        (e.0, Json(ApiResponse::error(e.1.error.clone().unwrap_or_default())))
+    })?;
+
+    state
+        .search_engine
+        .clear_pinned_rules(&index_name)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::error(e.to_string())),
+            )
+        })?;
+
+    Ok(Json(ApiResponse::success(serde_json::json!({
+        "message": "Pinned rules cleared successfully"
+    }))))
 }

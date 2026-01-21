@@ -342,6 +342,39 @@ $response = Http::post('http://localhost:3000/indices/kindergartens/search', [
 $results = $response->json()['data'];
 ```
 
+# Exact match filter
+curl -X POST http://localhost:3000/indices/myindex/search \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": "collection_handle:my-collection",
+    "limit": 10
+  }' | jq '.'
+
+# Combine with search terms
+curl -X POST http://localhost:3000/indices/myindex/search \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": "tariff AND collection_handle:my-collection",
+    "limit": 10,
+    "fuzzy": true
+  }' | jq '.'
+
+# Multiple collections (using OR)
+curl -X POST http://localhost:3000/indices/myindex/search \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": "tariff AND (collection_handle:collection-a OR collection_handle:collection-b)",
+    "limit": 10
+  }' | jq '.'
+
+# Multiple collections (using IN syntax - more efficient)
+curl -X POST http://localhost:3000/indices/myindex/search \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query": "tariff AND collection_handle:IN[collection-a,collection-b,collection-c]",
+    "limit": 10
+  }' | jq '.'
+
 ### JavaScript/Node.js
 
 ```javascript

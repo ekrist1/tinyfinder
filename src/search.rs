@@ -2,22 +2,40 @@ use anyhow::{anyhow, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
+use tantivy::aggregation::agg_req::Aggregations;
+use tantivy::aggregation::agg_result::AggregationResults;
+use tantivy::aggregation::AggregationCollector;
 use tantivy::collector::TopDocs;
-use tantivy::query::{BooleanQuery, FuzzyTermQuery, Occur, Query, QueryParser, RegexQuery};
+use tantivy::query::{
+    BooleanQuery, ExistsQuery, FuzzyTermQuery, Occur, Query, QueryParser, RegexPhraseQuery,
+    RegexQuery, TermSetQuery,
+};
 use tantivy::schema::*;
 use tantivy::tokenizer::{LowerCaser, SimpleTokenizer, Stemmer, TextAnalyzer};
 use tantivy::{Index, IndexWriter, Order, ReloadPolicy, TantivyDocument, Term};
 
 use crate::models::{
-    AggregationBucket, AggregationRequest, AggregationResult, Document, FieldConfig, FieldStats,
-    HighlightOptions, IndexStats, SearchHit, SortOption, SortOrder, StatsResult,
+    AggregationRequest, Document, FieldConfig, FieldStats, HighlightOptions, IndexStats,
+    PinnedRule, SearchHit, SortOption, SortOrder, SynonymGroup,
 };
 
-pub type SearchResult = Result<(Vec<SearchHit>, usize, f64, Option<Vec<AggregationResult>>)>;
+/// Default index writer memory budget (100MB)
+const DEFAULT_INDEX_WRITER_MEMORY: usize = 100_000_000;
+
+/// Check if a word is a boolean operator (for query parsing)
+fn is_operator(word: &str) -> bool {
+    matches!(word.to_uppercase().as_str(), "AND" | "OR" | "NOT" | "TO")
+}
+
+pub type SearchResult = Result<(Vec<SearchHit>, usize, f64, Option<AggregationResults>)>;
 
 pub struct SearchEngine {
     base_path: String,
     indices: Arc<RwLock<HashMap<String, IndexHandle>>>,
+    /// Synonyms stored per index: index_name -> list of synonym groups
+    synonyms: Arc<RwLock<HashMap<String, Vec<SynonymGroup>>>>,
+    /// Pinned rules stored per index: index_name -> list of pinned rules
+    pinned_rules: Arc<RwLock<HashMap<String, Vec<PinnedRule>>>>,
 }
 
 pub struct IndexHandle {
@@ -32,10 +50,201 @@ impl SearchEngine {
     pub fn new(base_path: &str) -> Result<Self> {
         std::fs::create_dir_all(base_path)?;
 
+        // Load synonyms from file if exists
+        let synonyms_path = Path::new(base_path).join("synonyms.json");
+        let synonyms: HashMap<String, Vec<SynonymGroup>> = if synonyms_path.exists() {
+            let content = std::fs::read_to_string(&synonyms_path)?;
+            serde_json::from_str(&content).unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
+
+        // Load pinned rules from file if exists
+        let pinned_path = Path::new(base_path).join("pinned_rules.json");
+        let pinned_rules: HashMap<String, Vec<PinnedRule>> = if pinned_path.exists() {
+            let content = std::fs::read_to_string(&pinned_path)?;
+            serde_json::from_str(&content).unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
+
         Ok(Self {
             base_path: base_path.to_string(),
             indices: Arc::new(RwLock::new(HashMap::new())),
+            synonyms: Arc::new(RwLock::new(synonyms)),
+            pinned_rules: Arc::new(RwLock::new(pinned_rules)),
         })
+    }
+
+    /// Save pinned rules to disk
+    fn save_pinned_rules(&self) -> Result<()> {
+        let rules = self.pinned_rules.read().unwrap();
+        let pinned_path = Path::new(&self.base_path).join("pinned_rules.json");
+        let content = serde_json::to_string_pretty(&*rules)?;
+        std::fs::write(pinned_path, content)?;
+        Ok(())
+    }
+
+    /// Add pinned rules for an index
+    pub fn add_pinned_rules(&self, index_name: &str, rules: Vec<PinnedRule>) -> Result<()> {
+        let mut pinned = self.pinned_rules.write().unwrap();
+        let entry = pinned.entry(index_name.to_string()).or_default();
+        entry.extend(rules);
+        drop(pinned);
+        self.save_pinned_rules()?;
+        Ok(())
+    }
+
+    /// Get pinned rules for an index
+    pub fn get_pinned_rules(&self, index_name: &str) -> Vec<PinnedRule> {
+        let rules = self.pinned_rules.read().unwrap();
+        rules.get(index_name).cloned().unwrap_or_default()
+    }
+
+    /// Clear all pinned rules for an index
+    pub fn clear_pinned_rules(&self, index_name: &str) -> Result<()> {
+        let mut rules = self.pinned_rules.write().unwrap();
+        rules.remove(index_name);
+        drop(rules);
+        self.save_pinned_rules()?;
+        Ok(())
+    }
+
+    /// Get pinned document IDs for a query
+    fn get_pinned_doc_ids(&self, index_name: &str, query_str: &str) -> Vec<String> {
+        let rules = self.pinned_rules.read().unwrap();
+        let query_lower = query_str.to_lowercase();
+        
+        if let Some(index_rules) = rules.get(index_name) {
+            for rule in index_rules {
+                // Check if query matches any of the trigger terms
+                for trigger in &rule.queries {
+                    if query_lower.contains(&trigger.to_lowercase()) {
+                        return rule.document_ids.clone();
+                    }
+                }
+            }
+        }
+        
+        Vec::new()
+    }
+
+    /// Save synonyms to disk
+    fn save_synonyms(&self) -> Result<()> {
+        let synonyms = self.synonyms.read().unwrap();
+        let synonyms_path = Path::new(&self.base_path).join("synonyms.json");
+        let content = serde_json::to_string_pretty(&*synonyms)?;
+        std::fs::write(synonyms_path, content)?;
+        Ok(())
+    }
+
+    /// Add synonyms for an index
+    pub fn add_synonyms(&self, index_name: &str, synonym_groups: Vec<SynonymGroup>) -> Result<()> {
+        let mut synonyms = self.synonyms.write().unwrap();
+        let entry = synonyms.entry(index_name.to_string()).or_default();
+        entry.extend(synonym_groups);
+        drop(synonyms);
+        self.save_synonyms()?;
+        Ok(())
+    }
+
+    /// Get synonyms for an index
+    pub fn get_synonyms(&self, index_name: &str) -> Vec<SynonymGroup> {
+        let synonyms = self.synonyms.read().unwrap();
+        synonyms.get(index_name).cloned().unwrap_or_default()
+    }
+
+    /// Clear all synonyms for an index
+    pub fn clear_synonyms(&self, index_name: &str) -> Result<()> {
+        let mut synonyms = self.synonyms.write().unwrap();
+        synonyms.remove(index_name);
+        drop(synonyms);
+        self.save_synonyms()?;
+        Ok(())
+    }
+
+    /// Expand a query term with its synonyms
+    fn expand_with_synonyms(&self, index_name: &str, term: &str) -> Vec<String> {
+        let synonyms = self.synonyms.read().unwrap();
+        let term_lower = term.to_lowercase();
+        
+        if let Some(groups) = synonyms.get(index_name) {
+            for group in groups {
+                // Check if this term is in any synonym group
+                if group.terms.iter().any(|t| t.to_lowercase() == term_lower) {
+                    // Return all terms in the group (including the original)
+                    return group.terms.iter()
+                        .map(|t| t.to_lowercase())
+                        .collect();
+                }
+            }
+        }
+        
+        // No synonyms found, return just the original term
+        vec![term_lower]
+    }
+
+    /// Expand a full query string with synonyms
+    fn expand_query_with_synonyms(&self, index_name: &str, query_str: &str) -> String {
+        // Simple tokenization - split on whitespace and handle quoted phrases
+        let mut result = String::new();
+        let mut in_quotes = false;
+        let mut current_word = String::new();
+        
+        for ch in query_str.chars() {
+            if ch == '"' {
+                in_quotes = !in_quotes;
+                result.push(ch);
+            } else if ch.is_whitespace() && !in_quotes {
+                if !current_word.is_empty() {
+                    // Check if this is an operator or special syntax
+                    if is_operator(&current_word) 
+                        || current_word.contains(':') 
+                        || current_word.contains('*')
+                        || current_word.contains('?') 
+                    {
+                        result.push_str(&current_word);
+                    } else {
+                        // Expand with synonyms
+                        let expanded = self.expand_with_synonyms(index_name, &current_word);
+                        if expanded.len() > 1 {
+                            // Multiple synonyms - wrap in parentheses with OR
+                            result.push('(');
+                            result.push_str(&expanded.join(" OR "));
+                            result.push(')');
+                        } else {
+                            result.push_str(&expanded[0]);
+                        }
+                    }
+                    current_word.clear();
+                }
+                result.push(ch);
+            } else {
+                current_word.push(ch);
+            }
+        }
+        
+        // Handle last word
+        if !current_word.is_empty() {
+            if is_operator(&current_word) 
+                || current_word.contains(':') 
+                || current_word.contains('*')
+                || current_word.contains('?') 
+            {
+                result.push_str(&current_word);
+            } else {
+                let expanded = self.expand_with_synonyms(index_name, &current_word);
+                if expanded.len() > 1 {
+                    result.push('(');
+                    result.push_str(&expanded.join(" OR "));
+                    result.push(')');
+                } else {
+                    result.push_str(&expanded[0]);
+                }
+            }
+        }
+        
+        result
     }
 
     pub fn load_indices(&self) -> Result<Vec<String>> {
@@ -65,7 +274,7 @@ impl SearchEngine {
                         .collect::<HashMap<_, _>>();
                     let field_configs = Self::field_configs_from_schema(&schema);
 
-                    match index.writer(50_000_000) {
+                    match index.writer(DEFAULT_INDEX_WRITER_MEMORY) {
                         Ok(writer) => {
                             let handle = IndexHandle {
                                 index,
@@ -232,6 +441,16 @@ impl SearchEngine {
                         fast: options.is_fast(),
                     });
                 }
+                FieldType::JsonObject(options) => {
+                    configs.push(FieldConfig {
+                        name: name.to_string(),
+                        field_type: "json".to_string(),
+                        stored: options.is_stored(),
+                        indexed: options.get_text_indexing_options().is_some(),
+                        analyzer: "default".to_string(),
+                        fast: options.is_expand_dots_enabled(),
+                    });
+                }
                 _ => {}
             }
         }
@@ -330,6 +549,24 @@ impl SearchEngine {
                     }
                     schema_builder.add_date_field(&field_config.name, options)
                 }
+                "json" => {
+                    // JSON field for dynamic/schemaless data
+                    let mut options = JsonObjectOptions::default();
+                    if field_config.stored {
+                        options = options.set_stored();
+                    }
+                    if field_config.indexed {
+                        options = options.set_indexing_options(
+                            TextFieldIndexing::default()
+                                .set_tokenizer("default")
+                                .set_index_option(IndexRecordOption::WithFreqsAndPositions),
+                        );
+                    }
+                    if field_config.fast {
+                        options = options.set_expand_dots_enabled();
+                    }
+                    schema_builder.add_json_field(&field_config.name, options)
+                }
                 _ => {
                     return Err(anyhow!(
                         "Unsupported field type: {}",
@@ -349,7 +586,7 @@ impl SearchEngine {
         // Register custom analyzers
         Self::register_analyzers(&index);
 
-        let writer = index.writer(50_000_000)?; // 50MB buffer
+        let writer = index.writer(DEFAULT_INDEX_WRITER_MEMORY)?;
 
         let handle = IndexHandle {
             index,
@@ -407,6 +644,12 @@ impl SearchEngine {
                                 tantivy_doc.add_date(*field, tantivy_dt);
                             }
                         }
+                        "json" => {
+                            // JSON field - convert serde_json::Value to OwnedValue
+                            use tantivy::schema::OwnedValue;
+                            let owned_value = OwnedValue::from(value.clone());
+                            tantivy_doc.add_field_value(*field, &owned_value);
+                        }
                         _ => match value {
                             serde_json::Value::String(s) => {
                                 tantivy_doc.add_text(*field, s);
@@ -456,6 +699,7 @@ impl SearchEngine {
             aggregations,
             false,
             None,
+            None,
         )
     }
 
@@ -471,6 +715,7 @@ impl SearchEngine {
         aggregations: &[AggregationRequest],
         fuzzy: bool,
         sort: Option<&SortOption>,
+        minimum_should_match: Option<usize>,
     ) -> SearchResult {
         self.search_internal(
             index_name,
@@ -482,6 +727,7 @@ impl SearchEngine {
             aggregations,
             fuzzy,
             sort,
+            minimum_should_match,
         )
     }
 
@@ -497,8 +743,18 @@ impl SearchEngine {
         aggregations: &[AggregationRequest],
         fuzzy: bool,
         sort: Option<&SortOption>,
+        minimum_should_match: Option<usize>,
     ) -> SearchResult {
         let start = std::time::Instant::now();
+
+        // Get pinned document IDs for this query BEFORE synonym expansion
+        // (we want to match on the original user query)
+        let pinned_ids = self.get_pinned_doc_ids(index_name, query_str);
+        let pinned_count = pinned_ids.len();
+
+        // Expand query with synonyms before processing
+        let expanded_query = self.expand_query_with_synonyms(index_name, query_str);
+        let query_str = expanded_query.as_str();
 
         let indices = self.indices.read().unwrap();
         let handle = indices
@@ -535,6 +791,16 @@ impl SearchEngine {
         };
 
         let mut query = Self::build_query(handle, query_str, &query_fields, fuzzy)?;
+
+        // Apply minimum_should_match if specified
+        // This wraps the query in a BooleanQuery with the minimum_should_match setting
+        if let Some(min_match) = minimum_should_match {
+            if min_match > 0 {
+                let mut bool_query = BooleanQuery::from(vec![(Occur::Should, query)]);
+                bool_query.set_minimum_number_should_match(min_match);
+                query = Box::new(bool_query);
+            }
+        }
 
         // Get total document count that matches the query
         let mut total = searcher.search(query.as_ref(), &tantivy::collector::Count)?;
@@ -608,12 +874,10 @@ impl SearchEngine {
                                     query.as_ref(),
                                     *field,
                                 ) {
-                                    let snippet = snippet_gen.snippet_from_doc(&retrieved_doc);
-                                    let html = snippet.to_html();
-                                    // Replace default <b> tags with custom tags
-                                    let highlighted = html
-                                        .replace("<b>", &opts.pre_tag)
-                                        .replace("</b>", &opts.post_tag);
+                                    let mut snippet = snippet_gen.snippet_from_doc(&retrieved_doc);
+                                    // Use custom highlight tags via the Snippet method
+                                    snippet.set_snippet_prefix_postfix(&opts.pre_tag, &opts.post_tag);
+                                    let highlighted = snippet.to_html();
                                     if !highlighted.is_empty() {
                                         highlight_map.insert(field_name.clone(), vec![highlighted]);
                                     }
@@ -672,9 +936,12 @@ impl SearchEngine {
                 SortOrder::Desc => Order::Desc,
             };
 
+            // Fetch extra results to ensure pinned documents are included
+            let fetch_limit = limit + pinned_count;
+
             match field_config.field_type.as_str() {
                 "i64" => {
-                    let collector = TopDocs::with_limit(limit)
+                    let collector = TopDocs::with_limit(fetch_limit)
                         .and_offset(offset)
                         .order_by_fast_field::<i64>(field_name, order);
                     let top_docs = searcher.search(query.as_ref(), &collector)?;
@@ -687,7 +954,7 @@ impl SearchEngine {
                     }
                 }
                 "f64" => {
-                    let collector = TopDocs::with_limit(limit)
+                    let collector = TopDocs::with_limit(fetch_limit)
                         .and_offset(offset)
                         .order_by_fast_field::<f64>(field_name, order);
                     let top_docs = searcher.search(query.as_ref(), &collector)?;
@@ -700,7 +967,7 @@ impl SearchEngine {
                     }
                 }
                 "date" => {
-                    let collector = TopDocs::with_limit(limit)
+                    let collector = TopDocs::with_limit(fetch_limit)
                         .and_offset(offset)
                         .order_by_fast_field::<tantivy::DateTime>(field_name, order);
                     let top_docs = searcher.search(query.as_ref(), &collector)?;
@@ -714,34 +981,38 @@ impl SearchEngine {
                 }
                 _ => {
                     return Err(anyhow!(
-                        "Sorting is only supported on fast i64, f64, or date fields. Field '{}' is type '{}'.",
+                        "Sorting is only supported on fast i64, f64, date, or string fields. Field '{}' is type '{}'.",
                         field_name,
                         field_config.field_type
                     ));
                 }
             }
         } else {
-            // Fetch offset + limit results, then skip offset
-            let top_docs = searcher.search(query.as_ref(), &TopDocs::with_limit(offset + limit))?;
+            // Fetch extra results to ensure pinned documents are included
+            let fetch_limit = offset + limit + pinned_count;
+            let top_docs = searcher.search(query.as_ref(), &TopDocs::with_limit(fetch_limit))?;
             for (score, doc_address) in top_docs.into_iter().skip(offset) {
                 add_hit(score, doc_address)?;
             }
         }
 
-        // Process aggregations
+        // Process aggregations using Tantivy's built-in AggregationCollector
         let agg_results = if !aggregations.is_empty() {
-            let mut results = Vec::new();
-            for agg_req in aggregations {
-                if let Some(agg_result) =
-                    self.compute_aggregation(handle, &searcher, query.as_ref(), agg_req)?
-                {
-                    results.push(agg_result);
+            match Self::build_aggregation_request(aggregations) {
+                Ok(agg_req) => {
+                    let collector = AggregationCollector::from_aggs(agg_req, Default::default());
+                    match searcher.search(query.as_ref(), &collector) {
+                        Ok(results) => Some(results),
+                        Err(e) => {
+                            tracing::warn!("Aggregation failed: {}", e);
+                            None
+                        }
+                    }
                 }
-            }
-            if results.is_empty() {
-                None
-            } else {
-                Some(results)
+                Err(e) => {
+                    tracing::warn!("Failed to build aggregation request: {}", e);
+                    None
+                }
             }
         } else {
             None
@@ -749,7 +1020,55 @@ impl SearchEngine {
 
         let took_ms = start.elapsed().as_secs_f64() * 1000.0;
 
+        // Reorder hits based on pinned rules and truncate to requested limit
+        let hits = self.apply_pinned_results(&pinned_ids, hits, limit);
+
         Ok((hits, total, took_ms, agg_results))
+    }
+
+    /// Apply pinned results - move pinned documents to the top in the specified order
+    /// and truncate to the requested limit
+    fn apply_pinned_results(
+        &self,
+        pinned_ids: &[String],
+        mut hits: Vec<SearchHit>,
+        limit: usize,
+    ) -> Vec<SearchHit> {
+        if pinned_ids.is_empty() {
+            // No pinned rules, just truncate to limit
+            hits.truncate(limit);
+            return hits;
+        }
+
+        // Extract pinned hits from the result set (maintain pinned order)
+        let mut pinned_hits: Vec<SearchHit> = Vec::new();
+        let mut remaining_hits: Vec<SearchHit> = Vec::new();
+
+        // Create a set of pinned IDs for quick lookup
+        let pinned_set: std::collections::HashSet<&String> = pinned_ids.iter().collect();
+
+        // Separate pinned and non-pinned hits
+        for hit in hits.drain(..) {
+            if pinned_set.contains(&hit.id) {
+                pinned_hits.push(hit);
+            } else {
+                remaining_hits.push(hit);
+            }
+        }
+
+        // Sort pinned hits according to the order in pinned_ids
+        pinned_hits.sort_by(|a, b| {
+            let pos_a = pinned_ids.iter().position(|id| id == &a.id).unwrap_or(usize::MAX);
+            let pos_b = pinned_ids.iter().position(|id| id == &b.id).unwrap_or(usize::MAX);
+            pos_a.cmp(&pos_b)
+        });
+
+        // Combine: pinned first, then remaining
+        pinned_hits.extend(remaining_hits);
+        
+        // Truncate to the requested limit
+        pinned_hits.truncate(limit);
+        pinned_hits
     }
 
     fn build_query(
@@ -758,12 +1077,95 @@ impl SearchEngine {
         query_fields: &[Field],
         fuzzy: bool,
     ) -> Result<Box<dyn Query>> {
+        // Preprocess field grouping syntax: title:(foo AND bar) -> (title:foo AND title:bar)
+        let query_str = Self::expand_field_grouping(query_str);
+        let query_str = query_str.as_str();
+        
         let query_parser = QueryParser::for_index(&handle.index, query_fields.to_vec());
+        
+        // Check for _exists_ query (e.g., "_exists_:field_name")
+        if let Some(field_name) = query_str.strip_prefix("_exists_:") {
+            let field_name = field_name.trim();
+            if handle.field_map.contains_key(field_name) {
+                // ExistsQuery::new(field_name, json_subpaths) - second param enables JSON subpath matching
+                return Ok(Box::new(ExistsQuery::new(field_name.to_string(), false)));
+            } else {
+                return Err(anyhow!("Field not found for exists query: {}", field_name));
+            }
+        }
+        
+        // Check for TermSetQuery syntax: field:IN[term1,term2,term3]
+        // This is more efficient than field:term1 OR field:term2 OR field:term3
+        if let Some(in_pos) = query_str.find(":IN[") {
+            let field_name = &query_str[..in_pos];
+            if let Some(field) = handle.field_map.get(field_name) {
+                // Find closing bracket
+                if let Some(close_pos) = query_str[in_pos..].find(']') {
+                    let terms_str = &query_str[in_pos + 4..in_pos + close_pos];
+                    let terms: Vec<Term> = terms_str
+                        .split(',')
+                        .map(|t| t.trim())
+                        .filter(|t| !t.is_empty())
+                        .map(|t| Term::from_field_text(*field, t))
+                        .collect();
+                    
+                    if !terms.is_empty() {
+                        return Ok(Box::new(TermSetQuery::new(terms)));
+                    }
+                }
+            }
+        }
         
         // Check if the query contains wildcards (* or ?)
         let has_wildcard = query_str.chars().any(|ch| matches!(ch, '*' | '?'));
         
-        // For wildcard queries, we need to create RegexQuery manually
+        // Check if this is a phrase query with wildcards (e.g., "b.* b.* wolf")
+        // RegexPhraseQuery handles multi-term wildcard phrase searches
+        if has_wildcard && query_str.starts_with('"') && query_str.ends_with('"') {
+            let phrase_content = &query_str[1..query_str.len() - 1];
+            let query_lower = phrase_content.to_lowercase();
+            
+            // Split into terms and convert each to regex pattern
+            let terms: Vec<String> = query_lower
+                .split_whitespace()
+                .map(|term| {
+                    // Convert wildcard to regex: * -> .*, ? -> .
+                    term.chars()
+                        .map(|c| match c {
+                            '*' => ".*".to_string(),
+                            '?' => ".".to_string(),
+                            '.' | '+' | '^' | '$' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\' => {
+                                format!("\\{}", c)
+                            }
+                            _ => c.to_string(),
+                        })
+                        .collect::<String>()
+                })
+                .collect();
+            
+            // Need at least 2 terms for a phrase query
+            if terms.len() >= 2 {
+                let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
+                
+                for field in query_fields {
+                    let field_entry = handle.schema.get_field_entry(*field);
+                    if matches!(field_entry.field_type(), FieldType::Str(_)) {
+                        let regex_phrase_query = RegexPhraseQuery::new(*field, terms.clone());
+                        clauses.push((Occur::Should, Box::new(regex_phrase_query)));
+                    }
+                }
+                
+                if !clauses.is_empty() {
+                    return Ok(if clauses.len() == 1 {
+                        clauses.into_iter().next().unwrap().1
+                    } else {
+                        Box::new(BooleanQuery::from(clauses))
+                    });
+                }
+            }
+        }
+        
+        // For non-phrase wildcard queries, we use RegexQuery
         // because Tantivy's default QueryParser doesn't support single-term wildcards
         if has_wildcard {
             // Convert wildcard syntax to regex syntax
@@ -938,6 +1340,131 @@ impl SearchEngine {
         Ok(Box::new(BooleanQuery::from(combined)))
     }
 
+    /// Expand field grouping syntax: title:(foo AND bar) -> (title:foo AND title:bar)
+    /// This enables Elasticsearch-style field grouping in queries
+    fn expand_field_grouping(query_str: &str) -> String {
+        // Pattern: field_name:(content)
+        // We need to find these and expand them
+        let mut i = 0;
+        let chars: Vec<char> = query_str.chars().collect();
+        let mut output = String::new();
+        
+        while i < chars.len() {
+            // Check if this could be the start of a field name
+            if chars[i].is_alphanumeric() || chars[i] == '_' {
+                // Collect potential field name
+                let field_start = i;
+                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let field_name: String = chars[field_start..i].iter().collect();
+                
+                // Check if followed by :(
+                if i + 1 < chars.len() && chars[i] == ':' && chars[i + 1] == '(' {
+                    // Find matching closing parenthesis
+                    let content_start = i + 2;
+                    let mut depth = 1;
+                    let mut content_end = content_start;
+                    
+                    while content_end < chars.len() && depth > 0 {
+                        if chars[content_end] == '(' {
+                            depth += 1;
+                        } else if chars[content_end] == ')' {
+                            depth -= 1;
+                        }
+                        content_end += 1;
+                    }
+                    
+                    if depth == 0 {
+                        // Extract the content (excluding the final closing paren)
+                        let content: String = chars[content_start..content_end - 1].iter().collect();
+                        
+                        // Expand: add field: prefix to each term that doesn't have a field
+                        let expanded = Self::add_field_prefix_to_terms(&field_name, &content);
+                        output.push('(');
+                        output.push_str(&expanded);
+                        output.push(')');
+                        i = content_end;
+                        continue;
+                    }
+                }
+                
+                // Not a field grouping, output as-is
+                output.push_str(&field_name);
+                continue;
+            }
+            
+            output.push(chars[i]);
+            i += 1;
+        }
+        
+        output
+    }
+    
+    /// Add field: prefix to terms in an expression that don't already have a field prefix
+    fn add_field_prefix_to_terms(field: &str, content: &str) -> String {
+        // Simple tokenization: split by spaces and operators, add prefix to words
+        let mut result = String::new();
+        let mut current_word = String::new();
+        let mut in_quotes = false;
+        let mut quote_char = '"';
+        
+        for c in content.chars() {
+            if (c == '"' || c == '\'') && !in_quotes {
+                // Starting a quote - output current word and start quoted section
+                if !current_word.is_empty() {
+                    if !current_word.contains(':') && !is_operator(&current_word) {
+                        result.push_str(field);
+                        result.push(':');
+                    }
+                    result.push_str(&current_word);
+                    current_word.clear();
+                }
+                in_quotes = true;
+                quote_char = c;
+                result.push(c);
+            } else if c == quote_char && in_quotes {
+                // Ending a quote
+                in_quotes = false;
+                // For phrases in quotes, prefix the whole quoted section
+                if !current_word.is_empty() {
+                    result.push_str(field);
+                    result.push(':');
+                    result.push(quote_char);
+                    result.push_str(&current_word);
+                }
+                result.push(c);
+                current_word.clear();
+            } else if in_quotes {
+                current_word.push(c);
+            } else if c.is_whitespace() || c == '(' || c == ')' {
+                // End of word
+                if !current_word.is_empty() {
+                    if !current_word.contains(':') && !is_operator(&current_word) {
+                        result.push_str(field);
+                        result.push(':');
+                    }
+                    result.push_str(&current_word);
+                    current_word.clear();
+                }
+                result.push(c);
+            } else {
+                current_word.push(c);
+            }
+        }
+        
+        // Handle final word
+        if !current_word.is_empty() {
+            if !current_word.contains(':') && !is_operator(&current_word) {
+                result.push_str(field);
+                result.push(':');
+            }
+            result.push_str(&current_word);
+        }
+        
+        result
+    }
+
     fn fallback_query_string(query_str: &str) -> Option<String> {
         let stopwords: HashSet<&'static str> = [
             "hva", "hvem", "hvor", "hvilken", "hvilke", "hvordan", "når", "hvorfor",
@@ -968,201 +1495,115 @@ impl SearchEngine {
         }
     }
 
-    fn compute_aggregation(
-        &self,
-        handle: &IndexHandle,
-        searcher: &tantivy::Searcher,
-        query: &dyn tantivy::query::Query,
-        agg_req: &AggregationRequest,
-    ) -> Result<Option<AggregationResult>> {
-        let field = match handle.field_map.get(&agg_req.field) {
-            Some(f) => *f,
-            None => return Ok(None),
-        };
+    /// Build an Elasticsearch-compatible aggregation request from our AggregationRequest format
+    fn build_aggregation_request(aggregations: &[AggregationRequest]) -> Result<Aggregations> {
+        let mut agg_map = serde_json::Map::new();
 
-        match agg_req.agg_type.as_str() {
-            "terms" => {
-                // Collect unique values and their counts
-                let top_docs = searcher.search(query, &TopDocs::with_limit(10000))?;
-                let mut term_counts: HashMap<String, u64> = HashMap::new();
-
-                for (_score, doc_address) in top_docs {
-                    let doc: TantivyDocument = searcher.doc(doc_address)?;
-                    let key: Option<String> =
-                        doc.get_all(field).next().map(|v| -> tantivy::schema::OwnedValue { v.into() }).and_then(|value| match value {
-                            tantivy::schema::OwnedValue::Str(s) => Some(s.to_string()),
-                            tantivy::schema::OwnedValue::I64(n) => Some(n.to_string()),
-                            tantivy::schema::OwnedValue::U64(n) => Some(n.to_string()),
-                            tantivy::schema::OwnedValue::F64(n) => Some(n.to_string()),
-                            _ => None,
-                        });
-                    if let Some(k) = key {
-                        *term_counts.entry(k).or_insert(0) += 1;
+        for agg_req in aggregations {
+            let agg_def = match agg_req.agg_type.as_str() {
+                "terms" => {
+                    let mut terms = serde_json::json!({
+                        "field": agg_req.field
+                    });
+                    if let Some(size) = agg_req.size {
+                        terms["size"] = serde_json::json!(size);
                     }
+                    serde_json::json!({ "terms": terms })
                 }
-
-                let size = agg_req.size.unwrap_or(10);
-                let mut buckets: Vec<_> = term_counts.into_iter().collect();
-                buckets.sort_by(|a, b| b.1.cmp(&a.1));
-                buckets.truncate(size);
-
-                let result_buckets = buckets
-                    .into_iter()
-                    .map(|(key, count)| AggregationBucket {
-                        key: serde_json::Value::String(key),
-                        doc_count: count,
+                "stats" => {
+                    serde_json::json!({
+                        "stats": { "field": agg_req.field }
                     })
-                    .collect();
-
-                Ok(Some(AggregationResult {
-                    name: agg_req.name.clone(),
-                    buckets: Some(result_buckets),
-                    stats: None,
-                }))
-            }
-            "stats" => {
-                let top_docs = searcher.search(query, &TopDocs::with_limit(100000))?;
-                let mut values: Vec<f64> = Vec::new();
-
-                for (_score, doc_address) in top_docs {
-                    let doc: TantivyDocument = searcher.doc(doc_address)?;
-                    let num: Option<f64> =
-                        doc.get_all(field).next().map(|v| -> tantivy::schema::OwnedValue { v.into() }).and_then(|value| match value {
-                            tantivy::schema::OwnedValue::I64(n) => Some(n as f64),
-                            tantivy::schema::OwnedValue::U64(n) => Some(n as f64),
-                            tantivy::schema::OwnedValue::F64(n) => Some(n),
-                            _ => None,
-                        });
-                    if let Some(n) = num {
-                        values.push(n);
-                    }
                 }
-
-                if values.is_empty() {
-                    return Ok(None);
-                }
-
-                let count = values.len() as u64;
-                let sum: f64 = values.iter().sum();
-                let avg = if count > 0 {
-                    Some(sum / count as f64)
-                } else {
-                    None
-                };
-                let min = values.iter().copied().fold(f64::INFINITY, f64::min);
-                let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-
-                Ok(Some(AggregationResult {
-                    name: agg_req.name.clone(),
-                    buckets: None,
-                    stats: Some(StatsResult {
-                        count,
-                        sum,
-                        avg,
-                        min: Some(min),
-                        max: Some(max),
-                    }),
-                }))
-            }
-            "histogram" => {
-                let interval = agg_req.interval.unwrap_or(10.0);
-                let top_docs = searcher.search(query, &TopDocs::with_limit(100000))?;
-                let mut bucket_counts: HashMap<i64, u64> = HashMap::new();
-
-                for (_score, doc_address) in top_docs {
-                    let doc: TantivyDocument = searcher.doc(doc_address)?;
-                    let num: Option<f64> =
-                        doc.get_all(field).next().map(|v| -> tantivy::schema::OwnedValue { v.into() }).and_then(|value| match value {
-                            tantivy::schema::OwnedValue::I64(n) => Some(n as f64),
-                            tantivy::schema::OwnedValue::U64(n) => Some(n as f64),
-                            tantivy::schema::OwnedValue::F64(n) => Some(n),
-                            _ => None,
-                        });
-                    if let Some(n) = num {
-                        let bucket_key = (n / interval).floor() as i64;
-                        *bucket_counts.entry(bucket_key).or_insert(0) += 1;
-                    }
-                }
-
-                let mut buckets: Vec<_> = bucket_counts.into_iter().collect();
-                buckets.sort_by_key(|(k, _)| *k);
-
-                let result_buckets = buckets
-                    .into_iter()
-                    .map(|(key, count)| AggregationBucket {
-                        key: serde_json::json!(key as f64 * interval),
-                        doc_count: count,
+                "avg" => {
+                    serde_json::json!({
+                        "avg": { "field": agg_req.field }
                     })
-                    .collect();
-
-                Ok(Some(AggregationResult {
-                    name: agg_req.name.clone(),
-                    buckets: Some(result_buckets),
-                    stats: None,
-                }))
-            }
-            "range" => {
-                let ranges = match &agg_req.ranges {
-                    Some(r) => r,
-                    None => return Ok(None),
-                };
-
-                let top_docs = searcher.search(query, &TopDocs::with_limit(100000))?;
-                let mut values: Vec<f64> = Vec::new();
-
-                for (_score, doc_address) in top_docs {
-                    let doc: TantivyDocument = searcher.doc(doc_address)?;
-                    let num: Option<f64> =
-                        doc.get_all(field).next().map(|v| -> tantivy::schema::OwnedValue { v.into() }).and_then(|value| match value {
-                            tantivy::schema::OwnedValue::I64(n) => Some(n as f64),
-                            tantivy::schema::OwnedValue::U64(n) => Some(n as f64),
-                            tantivy::schema::OwnedValue::F64(n) => Some(n),
-                            _ => None,
-                        });
-                    if let Some(n) = num {
-                        values.push(n);
-                    }
                 }
-
-                let result_buckets = ranges
-                    .iter()
-                    .map(|range| {
-                        let count = values
-                            .iter()
-                            .filter(|&&v| {
-                                let above_from = range.from.map(|f| v >= f).unwrap_or(true);
-                                let below_to = range.to.map(|t| v < t).unwrap_or(true);
-                                above_from && below_to
-                            })
-                            .count() as u64;
-
-                        let key = format!(
-                            "{}-{}",
-                            range
-                                .from
-                                .map(|f| f.to_string())
-                                .unwrap_or_else(|| "*".to_string()),
-                            range
-                                .to
-                                .map(|t| t.to_string())
-                                .unwrap_or_else(|| "*".to_string())
-                        );
-
-                        AggregationBucket {
-                            key: serde_json::Value::String(key),
-                            doc_count: count,
+                "min" => {
+                    serde_json::json!({
+                        "min": { "field": agg_req.field }
+                    })
+                }
+                "max" => {
+                    serde_json::json!({
+                        "max": { "field": agg_req.field }
+                    })
+                }
+                "sum" => {
+                    serde_json::json!({
+                        "sum": { "field": agg_req.field }
+                    })
+                }
+                "count" => {
+                    serde_json::json!({
+                        "value_count": { "field": agg_req.field }
+                    })
+                }
+                "cardinality" => {
+                    serde_json::json!({
+                        "cardinality": { "field": agg_req.field }
+                    })
+                }
+                "histogram" => {
+                    let interval = agg_req.interval.unwrap_or(10.0);
+                    serde_json::json!({
+                        "histogram": {
+                            "field": agg_req.field,
+                            "interval": interval
                         }
                     })
-                    .collect();
+                }
+                "range" => {
+                    let ranges: Vec<serde_json::Value> = agg_req
+                        .ranges
+                        .as_ref()
+                        .map(|r| {
+                            r.iter()
+                                .map(|range| {
+                                    let mut obj = serde_json::Map::new();
+                                    if let Some(from) = range.from {
+                                        obj.insert("from".to_string(), serde_json::json!(from));
+                                    }
+                                    if let Some(to) = range.to {
+                                        obj.insert("to".to_string(), serde_json::json!(to));
+                                    }
+                                    serde_json::Value::Object(obj)
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
 
-                Ok(Some(AggregationResult {
-                    name: agg_req.name.clone(),
-                    buckets: Some(result_buckets),
-                    stats: None,
-                }))
-            }
-            _ => Ok(None),
+                    serde_json::json!({
+                        "range": {
+                            "field": agg_req.field,
+                            "ranges": ranges
+                        }
+                    })
+                }
+                "percentiles" => {
+                    serde_json::json!({
+                        "percentiles": { "field": agg_req.field }
+                    })
+                }
+                "extended_stats" => {
+                    serde_json::json!({
+                        "extended_stats": { "field": agg_req.field }
+                    })
+                }
+                _ => {
+                    return Err(anyhow!("Unsupported aggregation type: {}", agg_req.agg_type));
+                }
+            };
+
+            agg_map.insert(agg_req.name.clone(), agg_def);
         }
+
+        let agg_json = serde_json::Value::Object(agg_map);
+        let aggregations: Aggregations = serde_json::from_value(agg_json)
+            .map_err(|e| anyhow!("Failed to parse aggregations: {}", e))?;
+
+        Ok(aggregations)
     }
 
     pub fn suggest(

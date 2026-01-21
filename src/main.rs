@@ -133,6 +133,12 @@ async fn main() -> anyhow::Result<()> {
             delete(handlers::delete_document),
         )
         .route("/indices/:name/bulk", post(handlers::bulk_operation))
+        .route("/indices/:name/synonyms", post(handlers::add_synonyms))
+        .route("/indices/:name/synonyms", get(handlers::get_synonyms))
+        .route("/indices/:name/synonyms", delete(handlers::clear_synonyms))
+        .route("/indices/:name/pinned", post(handlers::add_pinned_rules))
+        .route("/indices/:name/pinned", get(handlers::get_pinned_rules))
+        .route("/indices/:name/pinned", delete(handlers::clear_pinned_rules))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::auth_middleware,

@@ -114,7 +114,13 @@ Content-Type: application/json
 }
 ```
 
-Field types: `text`, `string`, `i64`, `f64`, `date`
+Field types: `text`, `string`, `i64`, `f64`, `date`, `json`
+
+- **text**: Full-text searchable, tokenized
+- **string**: Exact match (no tokenization), useful for IDs, tags
+- **i64/f64**: Numeric fields for sorting and range queries
+- **date**: DateTime fields, use ISO 8601 format
+- **json**: Nested JSON objects, searchable with dot notation (e.g., `attributes.category:electronics`)
 
 For sorting and aggregations, set `"fast": true` on the field (required for date sorting).
 
@@ -231,6 +237,253 @@ To sort by a date field, define the field as `"field_type": "date"` and set `"fa
 ```
 
 Supported sort field types: `i64`, `f64`, `date` (must be `fast: true`).
+
+#### Advanced Query Features
+
+**Field Grouping**: Use parentheses to group terms for a specific field:
+```json
+{
+  "query": "title:(return AND \"pink panther\")"
+}
+```
+This expands to `(title:return AND title:\"pink panther\")`.
+
+**Exists Query**: Find documents where a field has any value:
+```json
+{
+  "query": "_exists_:description"
+}
+```
+
+**Phrase Wildcards**: Use wildcards in phrase queries:
+```json
+{
+  "query": "\"b.* b.* wolf\""
+}
+```
+This matches phrases where any word starting with "b" appears twice before "wolf".
+
+**Minimum Should Match**: Require a minimum number of terms to match:
+```json
+{
+  "query": "cat dog bird",
+  "minimum_should_match": 2
+}
+```
+This requires at least 2 of the 3 terms to match.
+
+**Term Set Query**: Efficiently search for documents matching any of multiple exact terms:
+```json
+{
+  "query": "category:IN[electronics,computers,phones]"
+}
+```
+This is more efficient than `category:electronics OR category:computers OR category:phones` when searching for many exact values.
+
+#### Aggregations
+
+Aggregations allow you to compute statistics and group data across your search results. Supported types:
+
+- **terms**: Group by field values (bucket aggregation)
+- **stats**: Compute min, max, avg, sum, count
+- **avg/min/max/sum**: Single metric aggregations
+- **range**: Group into custom ranges
+- **date_histogram**: Group by date intervals
+- **histogram**: Group by numeric intervals
+- **cardinality**: Count unique values
+- **percentiles**: Compute percentile values
+- **extended_stats**: Extended statistics including variance and std deviation
+
+Example with nested aggregations:
+```json
+{
+  "query": "*",
+  "aggregations": [
+    {
+      "name": "by_category",
+      "agg_type": "terms",
+      "field": "category"
+    },
+    {
+      "name": "price_stats",
+      "agg_type": "stats",
+      "field": "price"
+    }
+  ]
+}
+```
+
+Aggregation results are returned in Elasticsearch-compatible format.
+
+### Synonyms
+
+Synonyms allow you to expand search terms with equivalent words. When a user searches for "tariff", documents containing "tariffavtale" or "hovedtariffavtale" can also match.
+
+#### Add Synonyms
+
+```bash
+POST /indices/products/synonyms
+Content-Type: application/json
+
+{
+  "synonyms": [
+    {
+      "terms": ["tariff", "tariffavtale", "hovedtariffavtale"]
+    },
+    {
+      "terms": ["avtale", "kontrakt", "overenskomst"]
+    }
+  ]
+}
+```
+
+```curl
+curl -X POST http://localhost:3000/indices/myindex/synonyms \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "synonyms": [
+      {"terms": ["tariff", "tariffavtale", "hovedtariffavtale"]}
+    ]
+  }'
+```
+
+All terms in a synonym group are treated as equivalent. When searching for any term in the group, all related terms will be included in the query.
+
+#### Get Synonyms
+
+```bash
+GET /indices/products/synonyms
+```
+
+Response:
+```json
+{
+  "success": true,
+  "data": {
+    "synonyms": [
+      {"terms": ["tariff", "tariffavtale", "hovedtariffavtale"]},
+      {"terms": ["avtale", "kontrakt", "overenskomst"]}
+    ]
+  }
+}
+```
+
+#### Clear Synonyms
+
+```bash
+DELETE /indices/products/synonyms
+```
+
+#### How Synonyms Work
+
+When you search for "tariff" and synonyms are configured:
+1. The query is expanded to `(tariff OR tariffavtale OR hovedtariffavtale)`
+2. Documents matching any of these terms will be returned
+3. Synonyms are applied at query time (no reindexing required)
+
+**Note:** For substring matching within compound words (like finding "hovedtariffavtale" when searching "tariff"), use wildcards: `tariff*`
+
+### Pinned Results (Promoted Documents)
+
+Pinned results allow you to manually override search rankings for specific queries. When a user searches for a query matching a pinned rule, the specified documents are always shown at the top of results.
+
+#### Add Pinned Rules
+
+```bash
+POST /indices/products/pinned
+Content-Type: application/json
+
+{
+  "rules": [
+    {
+      "queries": ["tariff", "hovedtariff"],
+      "document_ids": ["doc_123", "doc_456"]
+    },
+    {
+      "queries": ["sale", "discount"],
+      "document_ids": ["promo_001"]
+    }
+  ]
+}
+```
+
+Each rule specifies:
+- `queries`: List of search terms that trigger this rule (case-insensitive substring match)
+- `document_ids`: List of document IDs to pin to the top, in order
+
+#### Get Pinned Rules
+
+```bash
+GET /indices/products/pinned
+```
+
+Response:
+```json
+{
+  "success": true,
+  "data": {
+    "rules": [
+      {
+        "queries": ["tariff", "hovedtariff"],
+        "document_ids": ["doc_123", "doc_456"]
+      }
+    ]
+  }
+}
+```
+
+```curl
+# Add a rule: when searching "tariff", pin doc_123 to top
+curl -X POST http://localhost:3000/indices/myindex/pinned \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "rules": [
+      {"queries": ["tariff"], "document_ids": ["doc_123", "doc_456"]}
+    ]
+  }'
+``
+
+#### Clear Pinned Rules
+
+```bash
+DELETE /indices/products/pinned
+```
+
+#### How Pinned Results Work
+
+When you search for "tariff" and a pinned rule is configured:
+1. The search executes normally with BM25 ranking
+2. Documents matching the pinned rule are extracted from results
+3. Pinned documents are moved to the top in the specified order
+4. Remaining results follow in their original order
+
+**Example:**
+```bash
+# Without pinned rules, search for "tariff" returns:
+# 1. doc_789 (score: 8.5)
+# 2. doc_456 (score: 7.2)
+# 3. doc_123 (score: 6.8)
+
+# Add pinned rule
+curl -X POST http://localhost:3000/indices/myindex/pinned \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "rules": [
+      {"queries": ["tariff"], "document_ids": ["doc_123", "doc_456"]}
+    ]
+  }'
+
+# Now search for "tariff" returns:
+# 1. doc_123 (pinned)
+# 2. doc_456 (pinned)
+# 3. doc_789 (score: 8.5)
+```
+
+**Notes:**
+- Pinned documents must exist in search results to be promoted (they are reordered, not injected)
+- Multiple rules can exist; the first matching rule is applied
+- Query matching is case-insensitive and uses substring matching
+- Pinned rules are persisted to disk and survive restarts
 
 ### Generative Answers (Mistral)
 
